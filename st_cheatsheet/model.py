@@ -19,6 +19,8 @@ __all__ = [
     "FunctionEntry",
     "IndexUsage",
     "SchemaError",
+    "VERIFY_MODES",
+    "VerifySpec",
 ]
 
 
@@ -191,6 +193,91 @@ class Example:
         }
 
 
+#: How ``verify`` should treat an entry's stated result.
+#:
+#: ``exact``
+#:     The stated result must reproduce byte-for-byte (after cell-wise whitespace
+#:     trimming) on every supported server. This is the default, so a newly added
+#:     entry is verified unless someone deliberately exempts it.
+#: ``version-string``
+#:     The output *is* a version banner, so it can never match a fixed literal. The
+#:     SQL must still execute and return a non-empty value; the value is not compared.
+#: ``geos-sensitive``
+#:     The output is geometry (or a measurement derived from geometry) whose exact
+#:     form depends on the GEOS version PostGIS is linked against. A mismatch is
+#:     reported for a human to read but is not a build failure.
+VERIFY_MODES: tuple[str, ...] = ("exact", "version-string", "geos-sensitive")
+
+
+@dataclass(frozen=True, slots=True)
+class VerifySpec:
+    """Per-entry instructions for the ``verify`` subcommand.
+
+    Kept as data rather than a hardcoded list of function names in the verifier, so
+    that the exemption and its justification live next to the example they excuse.
+
+    :param mode: one of :data:`VERIFY_MODES`; defaults to ``exact``.
+    :param reason: why this entry is exempt. Required for every non-``exact`` mode -
+        an unexplained exemption is indistinguishable from a bug being hidden.
+    :param min_version: the PostGIS version this *example* needs, when that is higher
+        than the leading token of the entry's ``since``. Normally ``since`` is the
+        floor and this stays unset; it is needed only where the example deliberately
+        exercises a newer overload than the function's own introduction, so that
+        older servers skip the entry as unavailable instead of failing it.
+    """
+
+    mode: str = "exact"
+    reason: str = ""
+    min_version: str = ""
+
+    @classmethod
+    def from_dict(cls, raw: Any, *, source: str | None = None) -> "VerifySpec":
+        """Build a :class:`VerifySpec` from a parsed YAML mapping."""
+        if not isinstance(raw, Mapping):
+            raise SchemaError("field 'verify' must be a mapping", source=source)
+        _reject_unknown(raw, ("mode", "reason", "min_version"), source=source)
+        min_version = raw.get("min_version", "")
+        if not isinstance(min_version, str):
+            raise SchemaError("verify.min_version must be a string", source=source)
+        min_version = min_version.strip()
+        if min_version and not min_version.replace(".", "").isdigit():
+            raise SchemaError(
+                f"verify.min_version {min_version!r} must be a dotted version like '3.2'",
+                source=source,
+            )
+        mode = raw.get("mode", "exact")
+        if mode not in VERIFY_MODES:
+            valid = ", ".join(VERIFY_MODES)
+            raise SchemaError(
+                f"verify.mode {mode!r} is not one of: {valid}", source=source
+            )
+        reason = raw.get("reason", "")
+        if not isinstance(reason, str):
+            raise SchemaError("verify.reason must be a string", source=source)
+        reason = reason.strip()
+        if mode != "exact" and not reason:
+            raise SchemaError(
+                f"verify.mode {mode!r} needs a 'reason' explaining the exemption",
+                source=source,
+            )
+        if min_version and not reason:
+            raise SchemaError(
+                "verify.min_version needs a 'reason' saying which newer feature the "
+                "example uses",
+                source=source,
+            )
+        return cls(mode=mode, reason=reason, min_version=min_version)
+
+    @property
+    def is_exempt(self) -> bool:
+        """``True`` when this entry is not held to an exact result match."""
+        return self.mode != "exact"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable mapping."""
+        return {"mode": self.mode, "reason": self.reason, "min_version": self.min_version}
+
+
 @dataclass(frozen=True, slots=True)
 class IndexUsage:
     """How (and whether) a function participates in GiST index access.
@@ -253,6 +340,7 @@ class FunctionEntry:
     see_also: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     docs_url: str | None = None
+    verify: VerifySpec = field(default_factory=VerifySpec)
 
     #: Fields accepted in a YAML document, in schema order.
     YAML_FIELDS = (
@@ -270,6 +358,7 @@ class FunctionEntry:
         "see_also",
         "tags",
         "docs_url",
+        "verify",
     )
 
     @classmethod
@@ -317,6 +406,8 @@ class FunctionEntry:
             see_also=_string_list(raw, "see_also", source=source),
             tags=_string_list(raw, "tags", source=source),
             docs_url=docs_url,
+            # Absent means "verify me exactly": the strict default is the point.
+            verify=VerifySpec.from_dict(raw.get("verify", {}), source=source),
         )
 
     @property
@@ -347,6 +438,7 @@ class FunctionEntry:
             "see_also": list(self.see_also),
             "tags": list(self.tags),
             "docs_url": self.docs_url,
+            "verify": self.verify.to_dict(),
         }
 
 

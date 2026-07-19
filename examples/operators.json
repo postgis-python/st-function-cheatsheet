@@ -11,7 +11,7 @@
       ],
       "summary": "Returns true when the 2D bounding boxes of the two arguments intersect. This is the raw index operator: it compares cached boxes, never the actual vertices, so it is cheap but approximate. Every GiST-accelerated predicate in PostGIS is internally a && test followed by an exact recheck, which is why && on its own is the fastest possible spatial filter and also the least precise one.",
       "returns": "boolean",
-      "since": "1.0",
+      "since": "1.0 (geography since 1.5)",
       "arguments": [
         {
           "name": "A",
@@ -58,7 +58,12 @@
         "gist",
         "filter"
       ],
-      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/"
+      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "&&&",
@@ -113,7 +118,12 @@
         "operator",
         "nd"
       ],
-      "docs_url": "https://www.postgis-python.com/advanced-gist-indexing-optimization/"
+      "docs_url": "https://www.postgis-python.com/advanced-gist-indexing-optimization/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "<#>",
@@ -170,7 +180,12 @@
         "index",
         "operator"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "<->",
@@ -229,7 +244,12 @@
         "index",
         "operator"
       ],
-      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/"
+      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "@",
@@ -285,7 +305,12 @@
         "index",
         "operator"
       ],
-      "docs_url": "https://www.postgis-python.com/advanced-gist-indexing-optimization/"
+      "docs_url": "https://www.postgis-python.com/advanced-gist-indexing-optimization/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "~",
@@ -340,7 +365,12 @@
         "index",
         "operator"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     }
   ]
 }

@@ -64,6 +64,14 @@
     - ST_Transform
     - ST_IsValid
   tags: [introspection, version, diagnostics, upgrade]
+  verify:
+    mode: version-string
+    reason: >-
+      The output is the running installation's own banner, so it can never equal a
+      fixed literal: it changes with the PostGIS, GEOS, PROJ, libxml, libjson and
+      protobuf versions, and with the build options. The result block above is one
+      real 3.4.2 example kept for shape, not a value to assert on. verify only
+      requires that the call succeeds and returns something non-empty.
 
 - name: PostGIS_GEOS_Version
   category: utility
@@ -125,6 +133,13 @@
     - ST_IsValid
     - ST_Union
   tags: [introspection, version, geos, diagnostics]
+  verify:
+    mode: version-string
+    reason: >-
+      The output is the linked GEOS version, which differs on every server this is
+      run against - the same PostGIS release is relinked against different GEOS
+      builds by different distributions, which is precisely the point the entry
+      makes. verify only requires that the call succeeds and returns something.
 
 - name: ST_EstimatedExtent
   category: utility

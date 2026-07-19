@@ -7,7 +7,7 @@ pointing a :class:`rich.console.Console` at a string buffer.
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import TYPE_CHECKING, Iterable, Sequence
 
 from rich.console import Console, Group, RenderableType
 from rich.padding import Padding
@@ -20,12 +20,16 @@ from .loader import Dataset
 from .model import CATEGORY_DESCRIPTIONS, FunctionEntry
 from .search import SearchResult
 
+if TYPE_CHECKING:  # pragma: no cover - import kept lazy so `verify` stays optional
+    from .verify import Outcome, VerifyReport
+
 __all__ = [
     "SNIPPET_KINDS",
     "render_card",
     "render_categories",
     "render_list",
     "render_results",
+    "render_verify",
 ]
 
 #: Snippet names accepted by ``--snippet`` and by :meth:`Example.snippet`.
@@ -194,6 +198,81 @@ def render_problems(problems: Iterable[str]) -> RenderableType:
         text.append(f"{problem}\n")
     text.append(f"\n{len(listed)} problem(s)", style="bold red")
     return text
+
+
+#: Colour per verify status, ordered as the summary line prints them.
+_STATUS_STYLES: dict[str, str] = {
+    "matched": "green",
+    "mismatched": "bold red",
+    "failed": "bold red",
+    "since-suspect": "bold yellow",
+    "skipped": "dim",
+}
+
+
+def _render_outcome_detail(outcome: "Outcome") -> RenderableType:
+    """Return one outcome as a heading plus, when useful, an expected/actual diff."""
+    body: list[RenderableType] = [
+        Text.assemble(
+            (outcome.name, "bold"),
+            ("  ", ""),
+            (outcome.detail, _STATUS_STYLES.get(outcome.status, "")),
+        )
+    ]
+    if outcome.expected:
+        body.append(Padding(Text("expected", style="dim"), (0, 0, 0, 2)))
+        body.append(Padding(_code(outcome.expected, "text"), (0, 0, 0, 4)))
+    if outcome.actual and (outcome.expected or outcome.status != "skipped"):
+        body.append(Padding(Text("actual", style="dim"), (0, 0, 0, 2)))
+        body.append(Padding(_code(outcome.actual, "text"), (0, 0, 1, 4)))
+    return Group(*body)
+
+
+def render_verify(report: "VerifyReport", *, verbose: bool = False) -> RenderableType:
+    """Return the full ``verify`` report: server banner, problems, then a tally."""
+    body: list[RenderableType] = [
+        Text.assemble(("server  ", "bold cyan"), (str(report.server), "")),
+        Text(""),
+    ]
+
+    # Problems first and in severity order: a long run should put the thing you need
+    # to act on at the point where reading starts, not scrolled off the top.
+    for status, heading in (
+        ("mismatched", "Mismatched (the stated result is wrong here)"),
+        ("failed", "Failed to execute"),
+        ("since-suspect", "Suspect 'since' values (ran on an older server than claimed)"),
+    ):
+        outcomes = report.by_status(status)
+        if not outcomes:
+            continue
+        body.append(_heading(heading))
+        for outcome in outcomes:
+            body.append(Padding(_render_outcome_detail(outcome), (0, 0, 0, 2)))
+        body.append(Text(""))
+
+    skipped = report.by_status("skipped")
+    if skipped and verbose:
+        body.append(_heading("Skipped"))
+        for outcome in skipped:
+            body.append(Padding(_render_outcome_detail(outcome), (0, 0, 0, 2)))
+        body.append(Text(""))
+
+    counts = report.counts()
+    tally = Text()
+    for status, count in counts.items():
+        if tally:
+            tally.append("  ")
+        tally.append(f"{status} {count}", style=_STATUS_STYLES.get(status, "") if count else "dim")
+    body.append(tally)
+
+    total = sum(counts.values())
+    verdict = (
+        Text(f"{total} entries verified against PostGIS {report.server.postgis}", style="bold green")
+        if not report.failures
+        else Text(f"{len(report.failures)} entry/entries need attention", style="bold red")
+    )
+    body.append(verdict)
+    return Group(*body)
 
 
 def _first_sentence(summary: str) -> str:

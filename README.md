@@ -18,7 +18,7 @@ Ships a hand-written dataset of **92 PostGIS functions and operators** in
   whether you need an explicit `&&` prefilter;
 - two or three `common_mistakes` per entry, and `see_also` cross-references.
 
-Three interfaces read that one dataset:
+A few interfaces read that one dataset:
 
 | Command | Purpose |
 | --- | --- |
@@ -27,6 +27,7 @@ Three interfaces read that one dataset:
 | `python -m st_cheatsheet build --out dist/` | one self-contained, searchable HTML file |
 | `python -m st_cheatsheet export --format json` | structured data for other tools |
 | `python -m st_cheatsheet validate` | schema-check the dataset (CI-ready) |
+| `python -m st_cheatsheet verify --dsn ...` | run every SQL example against a live PostGIS and check the stated result |
 
 ## Why it exists
 
@@ -63,6 +64,13 @@ python3 -m venv .venv
 
 Python 3.10 or newer. Runtime dependencies are `PyYAML` and `rich`.
 For the test suite, use `requirements-dev.txt` instead.
+
+The `verify` subcommand additionally needs a PostgreSQL driver, kept out of the base
+requirements so that everything else works without one:
+
+```
+.venv/bin/pip install -r requirements-verify.txt
+```
 
 ## Usage
 
@@ -282,6 +290,46 @@ wrote examples/operators.json (6 functions)
 operators) and [gist-indexable.json](examples/gist-indexable.json) (every entry a GiST index can
 serve). `--format ndjson` emits one compact object per line for streaming consumers.
 
+### Verify against a live PostGIS
+
+`validate` proves the dataset is well-formed. `verify` proves it is *true*: it executes every
+entry's `example.sql` against a real server, each in its own rolled-back transaction, and compares
+the output to the `example.result` printed beside it.
+
+```
+$ python -m st_cheatsheet verify --dsn postgresql://postgres:pw@127.0.0.1:5432/verify
+server  PostGIS 3.4.3 / GEOS 3.9.0-CAPI-1.16.2 / 16.4 (Debian 16.4-1.pgdg110+2)
+
+matched 90  mismatched 0  failed 0  since-suspect 0  skipped 2
+92 entries verified against PostGIS 3.4.3
+```
+
+The DSN may also come from `$ST_CHEATSHEET_DSN` or `$DATABASE_URL`. `--verbose` lists the skipped
+entries and the reason each was exempted; `--category` and `--index-only` narrow the run.
+
+Values are compared as the *server* prints them. Once a first execution reveals the column types,
+a passthrough text loader is registered for each, so a boolean arrives as `t` rather than `True` —
+which is what the result blocks contain.
+
+Not every entry can match everywhere, and the exemptions are declared per-entry in the data rather
+than hardcoded in the verifier (see [the `verify` field](#the-verify-field) below). Five outcomes
+are possible:
+
+| Outcome | Meaning | Fails the build |
+| --- | --- | --- |
+| `matched` | output reproduced the stated result exactly | — |
+| `mismatched` | output differs and the entry claimed `exact` | yes |
+| `failed` | the SQL errored on a server new enough to run it | yes |
+| `since-suspect` | it ran and matched on a server *older* than the entry claims to need | only with `--strict-since` |
+| `skipped` | exempt by mode, or unavailable below the entry's declared floor | — |
+
+An example that errors on a server older than its own floor is skipped as *unavailable*, because
+that is evidence for the dataset rather than against it. The reverse case is the interesting one:
+if an entry claims `since: 3.4` but its example runs and matches on PostGIS 3.3, the version claim
+is not supported by the software, and `verify` reports it as `since-suspect`. That is a
+documentation bug worth a human's attention, so it is surfaced by default but only fails the build
+under `--strict-since`.
+
 ## How it works
 
 **The dataset is the product.** `data/functions/*.yaml` is hand-written, one file per category,
@@ -294,6 +342,25 @@ keys, so that a typo like `retruns:` fails loudly instead of silently dropping c
 name the file, index and function (`measurement.yaml#3 [ST_Area]: ...`). Cross-entry checks then
 run over the whole set in `validate_dataset`: duplicate names, `see_also` targets that do not
 resolve, and self-references. `build` refuses to run on a dataset that fails.
+
+<a id="the-verify-field"></a>
+**The `verify` field.** An optional per-entry mapping that tells `verify` how to treat the stated
+result. It is optional and defaults to `{mode: exact}`, so a newly added entry is checked strictly
+unless someone deliberately exempts it — and every exemption has to say why.
+
+| Key | Values | Meaning |
+| --- | --- | --- |
+| `mode` | `exact` (default) | the stated result must reproduce on every supported server |
+| | `version-string` | the output *is* a version banner, so it can never equal a fixed literal; the call must still succeed and return something non-empty, but the value is not compared |
+| | `geos-sensitive` | the output is geometry whose exact form depends on the linked GEOS version; a difference is reported with a diff for a human to read, but is not a build failure |
+| `reason` | free text | why the entry is exempt. **Required** for any non-`exact` mode and for `min_version`; an unexplained exemption is indistinguishable from a bug being hidden, so the schema rejects one |
+| `min_version` | dotted version | the PostGIS version this *example* needs, when that is higher than the leading token of `since`. Normally unset — `since` is the floor |
+
+`min_version` exists for the case where an example deliberately exercises an overload newer than
+the function itself. `ST_Point` dates from 1.0, but its example passes the SRID argument added in
+3.2; without the override, servers between 1.0 and 3.2 would report a false failure instead of
+skipping the entry as unavailable. It is a narrow escape hatch, not a way to lower the bar:
+`since` remains the source of truth everywhere else.
 
 **Search ranking is explainable, not statistical.** Score bands, best first: exact name (an
 `st_` prefix is optional, so `dwithin` matches `ST_DWithin`), name prefix, name substring, exact
@@ -337,10 +404,14 @@ There is no config file; behaviour is entirely by flag.
 | `--limit N` | cap search results (default 20) |
 | `--format {json,ndjson}` | export shape |
 | `--out PATH` | build/export destination |
+| `--dsn DSN` | `verify` target; falls back to `$ST_CHEATSHEET_DSN`, then `$DATABASE_URL` |
+| `--verbose` | `verify` also lists the skipped entries and why each was exempted |
+| `--strict-since` | `verify` treats a contradicted `since` value as a failure, not a warning |
 | `--no-color`, `--width N` | force plain output or a fixed width, for piping and CI logs |
 
-Exit codes: `0` success, `1` no results or validation failure, `2` usage error, `3` the dataset
-could not be loaded or the site could not be built.
+Exit codes: `0` success, `1` no results, validation failure, or a real `verify` mismatch,
+`2` usage error, `3` the dataset could not be loaded, the site could not be built, or `verify`
+could not reach a server.
 
 Adding an entry is a matter of appending to the relevant YAML file and running `validate`; the
 schema is enforced, so an incomplete entry cannot reach the page.
@@ -350,10 +421,12 @@ schema is enforced, so an incomplete entry cannot reach the page.
 ```
 $ .venv/bin/pip install -r requirements-dev.txt
 $ .venv/bin/python -m pytest
-202 passed in 3.17s
+249 passed in 3.61s
 ```
 
-The suite runs offline and needs no PostgreSQL, PostGIS, Docker or network. It covers:
+The suite runs offline and needs no PostgreSQL, PostGIS, Docker or network — including the
+`verify` tests, which fake the connection but assert against psycopg's real exception hierarchy.
+It covers:
 
 - **the real shipped dataset** against the schema — bad data fails CI, including checks that every
   Python snippet actually compiles, that `see_also` resolves, that slugs are unique, and that no
@@ -364,7 +437,11 @@ The suite runs offline and needs no PostgreSQL, PostGIS, Docker or network. It c
 - the HTML builder — expected sections present, the embedded JSON parses, escaping of HTML
   metacharacters and of `</script>` inside prose, and an **offline-safety assertion** that no
   `http(s)://` reference appears outside an `href`;
-- CLI exit codes for every command, including two real `python -m st_cheatsheet` subprocess runs.
+- CLI exit codes for every command, including two real `python -m st_cheatsheet` subprocess runs;
+- the `verify` classification matrix — match, mismatch, unavailable-below-floor, suspect `since`,
+  and each exemption mode — plus a check that every `since` in the shipped dataset parses and that
+  every `exact` entry's result block is actually comparable, since an unparseable one would be
+  silently skipped rather than checked.
 
 ## How the data was verified
 
@@ -377,14 +454,50 @@ corrections — mostly `since` versions (`Availability:` and `Changed:` mean dif
 a rename is not an introduction) and missing overloads in signatures. Every stated SQL result was
 recomputed by hand and none needed changing.
 
-All 92 SQL examples have since been *executed* against a live PostGIS 3.4.3 / PostgreSQL 16
-(GEOS 3.9.0, PROJ 7.2.1), each in its own rolled-back transaction. 90 reproduced their stated
-result exactly. The two that did not are `PostGIS_Full_Version` and `PostGIS_GEOS_Version`, whose
-stated output quotes a newer stack (GEOS 3.12.1, PROJ 9.4.0) than that test box runs; those are
-environment artifacts, not errors, and were deliberately left alone. No example needed a
-correction. The examples are written defensively — rounded magnitudes, feature counts and boolean
-assertions rather than raw coordinate dumps — which is why GEOS-sensitive entries such as
-`ST_Buffer`, `ST_ConcaveHull` and `ST_VoronoiPolygons` reproduce unchanged on an older GEOS.
+All 92 SQL examples are *executed* on every push by the `verify` job, each in its own rolled-back
+transaction, across five PostGIS releases. That check used to be an uncommitted local script
+against a single server; it is now a committed subcommand and a CI matrix, which is what makes the
+numbers below reproducible rather than remembered.
+
+| Image | PostGIS | GEOS | matched | mismatched | failed | skipped |
+| --- | --- | --- | --- | --- | --- | --- |
+| `14-3.3` | 3.3.4 | 3.9.0 | 90 | 0 | 0 | 2 |
+| `15-3.4` | 3.4.3 | 3.9.0 | 90 | 0 | 0 | 2 |
+| `16-3.4` | 3.4.3 | 3.9.0 | 90 | 0 | 0 | 2 |
+| `17-3.5` | 3.5.2 | 3.9.0 | 90 | 0 | 0 | 2 |
+| `18-3.6` | 3.6.4 | 3.13.1 | 89 | 0 | 0 | 3 |
+
+The examples are written defensively — rounded magnitudes, feature counts and boolean assertions
+rather than raw coordinate dumps — which is why 89 of 92 are byte-identical across a GEOS 3.9 to
+3.13 span. Three entries are exempt, each with its reason recorded in the data:
+
+- `PostGIS_Full_Version` and `PostGIS_GEOS_Version` are `version-string`. Their output *is* the
+  running installation's banner, so it can never equal a fixed literal; `verify` requires only
+  that the call succeeds and returns something. The stated results quote a real 3.4.2 box and are
+  kept for shape.
+- `ST_SimplifyPreserveTopology` is `geos-sensitive`, and this one was found by the matrix rather
+  than assumed. On GEOS 3.9.0 it returns the unchanged square
+  `POLYGON((0 0,10 0,10 10,0 10,0 0))`; on GEOS 3.13.1 it simplifies further, to the triangle
+  `POLYGON((0 10,10 0,10 10,0 10))`. The contrast the example exists to draw — plain `ST_Simplify`
+  returns NULL at this tolerance while the topology-preserving variant returns a valid non-empty
+  polygon — holds on both, so only the literal vertex list is exempt.
+
+One `since`-related correction came out of this. `ST_Point`'s example passes the three-argument
+SRID form, which the entry's own `since` string dates to 3.2, while its leading version is 1.0 —
+so the example had a higher floor than the function. Confirmed by running it against
+`postgis/postgis:13-3.1`, which fails with `function st_point(numeric, numeric, integer) does not
+exist`. The `since` prose was already correct and was left alone; the example now declares
+`verify.min_version: "3.2"`, so servers below 3.2 skip it as unavailable instead of reporting a
+false failure.
+
+No `since` value was contradicted in the other direction. The `since-suspect` check — an entry
+whose example runs and matches on a server *older* than it claims to need — fired zero times, but
+that is a weak result rather than a clean bill of health: the highest floor in the dataset is
+`ST_TileEnvelope` at 3.0, and the oldest image in the matrix is 3.3, so there is currently nothing
+in range for it to catch. The check earns its place on the next entry that claims 3.4 or later.
+Note also that it can only test the *leading* version in a `since` string; parenthetical claims
+like "geography since 2.0" describe overloads the examples do not exercise, and remain
+doc-sourced.
 
 What that verification can and cannot back:
 

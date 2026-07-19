@@ -66,3 +66,59 @@ jobs:
           name: st-function-cheatsheet-page
           path: dist/index.html
           retention-days: 14
+
+  # Every SQL example is executed against a real server and its stated result checked.
+  # The matrix spans the oldest and newest PostGIS worth supporting, because that is
+  # where the dataset's version claims are actually at risk: entries are skipped as
+  # unavailable below their declared floor, and a `since` that turns out to be too high
+  # is reported rather than silently accepted.
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgis: ["14-3.3", "15-3.4", "16-3.4", "17-3.5", "18-3.6"]
+
+    services:
+      postgis:
+        image: postgis/postgis:${{ matrix.postgis }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: verify
+          POSTGRES_DB: verify
+        ports:
+          - 5432:5432
+        # Without a healthcheck the job races the server's first-boot initdb, which for
+        # these images includes creating the postgis extension.
+        options: >-
+          --health-cmd "pg_isready -U postgres -d verify"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-verify.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-verify.txt
+
+      - name: Verify every example against PostGIS ${{ matrix.postgis }}
+        env:
+          ST_CHEATSHEET_DSN: postgresql://postgres:verify@127.0.0.1:5432/verify
+        # --strict-since promotes a contradicted `since` value from a warning to
+        # a failure. It currently never fires: the highest floor in the dataset
+        # is 3.0 and the oldest image here is 3.3, so nothing is in range for it
+        # to catch. That is exactly why it costs nothing to turn on now — an
+        # advisory line in a passing job's log is one nobody reads, and the first
+        # entry to claim 3.4+ should break the build rather than whisper. A
+        # genuinely contradicted value gets a `verify.min_version` with a written
+        # reason, which `validate` requires.
+        run: python -m st_cheatsheet --no-color --width 160 verify --verbose --strict-since

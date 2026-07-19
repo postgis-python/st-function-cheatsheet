@@ -5,15 +5,17 @@ CI jobs:
 
 ======  ============================================================
   0     success
-  1     no results, or the dataset failed validation
+  1     no results, the dataset failed validation, or `verify` found a real mismatch
   2     usage error (raised by argparse)
-  3     the dataset could not be loaded or the site could not be built
+  3     the dataset could not be loaded, the site could not be built, or `verify`
+        could not reach a server
 ======  ============================================================
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -33,6 +35,7 @@ from .render import (
     render_list,
     render_problems,
     render_results,
+    render_verify,
 )
 from .search import search as run_search
 
@@ -43,7 +46,7 @@ EXIT_NO_RESULTS = 1
 EXIT_DATASET = 3
 
 #: Subcommands, used to decide whether a bare first argument is a query or a command.
-_COMMANDS = ("search", "show", "list", "categories", "validate", "build", "export")
+_COMMANDS = ("search", "show", "list", "categories", "validate", "build", "export", "verify")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -105,6 +108,25 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser_.add_argument(
         "--title", default="PostGIS ST_* cheatsheet", help="page title"
     )
+
+    verify_parser = subparsers.add_parser(
+        "verify", help="run every SQL example against a live PostGIS and check the stated result"
+    )
+    verify_parser.add_argument(
+        "--dsn",
+        default=None,
+        metavar="DSN",
+        help="libpq connection string; defaults to $ST_CHEATSHEET_DSN, then $DATABASE_URL",
+    )
+    verify_parser.add_argument(
+        "--verbose", action="store_true", help="also list the skipped entries and why"
+    )
+    verify_parser.add_argument(
+        "--strict-since",
+        action="store_true",
+        help="treat a contradicted 'since' value as a failure, not just a warning",
+    )
+    add_filters(verify_parser)
 
     export_parser = subparsers.add_parser("export", help="dump the dataset as structured data")
     export_parser.add_argument("--format", choices=sorted(FORMATS), default="json", dest="fmt")
@@ -211,6 +233,30 @@ def _cmd_build(dataset: Dataset, args: argparse.Namespace, console: Console) -> 
     return EXIT_OK
 
 
+def _cmd_verify(dataset: Dataset, args: argparse.Namespace, console: Console) -> int:
+    """Execute every example against a live server and report the comparison."""
+    # Imported here, not at module scope, so that psycopg stays an optional dependency
+    # and every other subcommand keeps working without a database driver installed.
+    from .verify import VerifyError, verify_dataset
+
+    dsn = args.dsn or os.environ.get("ST_CHEATSHEET_DSN") or os.environ.get("DATABASE_URL")
+    if not dsn:
+        console.print(
+            "[bold red]error:[/] no DSN given; pass --dsn or set ST_CHEATSHEET_DSN"
+        )
+        return EXIT_DATASET
+
+    selected = _apply_filters(dataset, args)
+    try:
+        report = verify_dataset(selected, dsn)
+    except VerifyError as exc:
+        console.print(f"[bold red]error:[/] {exc}")
+        return EXIT_DATASET
+
+    console.print(render_verify(report, verbose=args.verbose))
+    return report.exit_code(strict_since=args.strict_since)
+
+
 def _cmd_export(dataset: Dataset, args: argparse.Namespace, console: Console) -> int:
     """Serialise the dataset to stdout or a file."""
     selected = _apply_filters(dataset, args)
@@ -260,4 +306,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_validate(dataset, console)
     if args.command == "build":
         return _cmd_build(dataset, args, console)
+    if args.command == "verify":
+        return _cmd_verify(dataset, args, console)
     return _cmd_export(dataset, args, console)

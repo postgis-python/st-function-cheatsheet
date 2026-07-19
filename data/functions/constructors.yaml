@@ -151,6 +151,15 @@
     - ST_Transform
     - ST_SRID
   tags: [point, constructor, srid, sql-mm]
+  verify:
+    min_version: "3.2"
+    reason: >-
+      ST_Point itself dates from 1.0, but this example passes the three-argument
+      srid form, which the entry's own since string dates to 3.2 - so the example
+      has a higher floor than the function. Confirmed on postgis/postgis:13-3.1
+      (PostGIS 3.1.4), where it fails with: function st_point(numeric, numeric,
+      integer) does not exist. Servers below 3.2 therefore skip this entry as
+      unavailable rather than reporting a false failure.
 
 - name: ST_MakeLine
   category: constructors

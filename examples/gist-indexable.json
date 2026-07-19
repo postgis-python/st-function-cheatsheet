@@ -57,7 +57,12 @@
         "containment",
         "index"
       ],
-      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/"
+      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "ST_ContainsProperly",
@@ -114,7 +119,12 @@
         "interior",
         "index"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "ST_CoveredBy",
@@ -126,7 +136,7 @@
       ],
       "summary": "Returns true when no point of A lies outside B - ST_Covers with the arguments reversed. It stands to ST_Within exactly as ST_Covers stands to ST_Contains: same shape of test, but boundary contact counts. Use it for \"is this feature entirely inside my area of interest\" when features legitimately abut the boundary, and to keep the indexed column in the leading position.",
       "returns": "boolean",
-      "since": "1.2.2 (geography since 1.5)",
+      "since": "1.2.2",
       "arguments": [
         {
           "name": "A",
@@ -172,7 +182,12 @@
         "geography",
         "boundary"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "ST_Covers",
@@ -230,7 +245,12 @@
         "geography",
         "boundary"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "ST_Crosses",
@@ -288,7 +308,12 @@
         "topology",
         "index"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "ST_DWithin",
@@ -359,7 +384,12 @@
         "index",
         "geography"
       ],
-      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/"
+      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "ST_Equals",
@@ -396,7 +426,7 @@
         "gist": true,
         "sargable": true,
         "needs_bbox_prefilter": false,
-        "notes": "Emits an && term like the other predicates, so it is index-assisted, though equality is such a selective test that the exact GEOS check dominates. Note that the = operator on geometry is a different thing entirely - it compares serialised representations and is what btree indexes and DISTINCT use."
+        "notes": "Index-assisted, despite the documentation page being silent about it. ST_Equals carries the same postgis_index_supportfn as ST_Intersects, and the term it emits is ~= (identical bounding box) rather than the && used by the other predicates - a tighter filter, since two equal geometries must have the same box. Verified on PostGIS 3.4.3 with EXPLAIN ANALYZE over a 5000-row GiST-indexed table: \"Bitmap Index Scan on cells_gix, Index Cond: (geom ~= '...'::geometry)\". An explicit && prefilter is therefore redundant. Note that the = operator on geometry is a different thing entirely - it compares serialised representations and is what btree indexes and DISTINCT use. Contrast ST_Disjoint and ST_Relate, which genuinely have no support function and always scan."
       },
       "common_mistakes": [
         "Confusing ST_Equals with the = operator. The former is spatial, the latter is byte-level, and they disagree on reversed or renumbered rings.",
@@ -416,7 +446,12 @@
         "diffing",
         "index"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "ST_Intersects",
@@ -475,7 +510,12 @@
         "index",
         "gist"
       ],
-      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/"
+      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "ST_Overlaps",
@@ -533,7 +573,12 @@
         "topology",
         "index"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "ST_Touches",
@@ -591,7 +636,12 @@
         "topology",
         "index"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "ST_Within",
@@ -649,7 +699,12 @@
         "viewport",
         "index"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "&&",
@@ -661,7 +716,7 @@
       ],
       "summary": "Returns true when the 2D bounding boxes of the two arguments intersect. This is the raw index operator: it compares cached boxes, never the actual vertices, so it is cheap but approximate. Every GiST-accelerated predicate in PostGIS is internally a && test followed by an exact recheck, which is why && on its own is the fastest possible spatial filter and also the least precise one.",
       "returns": "boolean",
-      "since": "1.0",
+      "since": "1.0 (geography since 1.5)",
       "arguments": [
         {
           "name": "A",
@@ -708,7 +763,12 @@
         "gist",
         "filter"
       ],
-      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/"
+      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "&&&",
@@ -763,7 +823,12 @@
         "operator",
         "nd"
       ],
-      "docs_url": "https://www.postgis-python.com/advanced-gist-indexing-optimization/"
+      "docs_url": "https://www.postgis-python.com/advanced-gist-indexing-optimization/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "<#>",
@@ -820,7 +885,12 @@
         "index",
         "operator"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "<->",
@@ -879,7 +949,12 @@
         "index",
         "operator"
       ],
-      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/"
+      "docs_url": "https://www.postgis-python.com/mastering-core-spatial-query-patterns/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "@",
@@ -935,7 +1010,12 @@
         "index",
         "operator"
       ],
-      "docs_url": "https://www.postgis-python.com/advanced-gist-indexing-optimization/"
+      "docs_url": "https://www.postgis-python.com/advanced-gist-indexing-optimization/",
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     },
     {
       "name": "~",
@@ -990,7 +1070,12 @@
         "index",
         "operator"
       ],
-      "docs_url": null
+      "docs_url": null,
+      "verify": {
+        "mode": "exact",
+        "reason": "",
+        "min_version": ""
+      }
     }
   ]
 }

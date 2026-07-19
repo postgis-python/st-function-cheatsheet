@@ -2,3 +2,8 @@
 
 pytest>=8
 pytest-cov>=5
+
+# The driver is a test dependency as well as a runtime one for `verify`: the offline
+# suite fakes the connection but asserts against psycopg's real exception hierarchy,
+# so importing it must work. No database is needed to run the suite.
+-r requirements-verify.txt

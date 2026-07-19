@@ -1,0 +1,5 @@
+# Extra dependency for `python -m st_cheatsheet verify`, which needs to talk to a live
+# PostGIS server. Everything else in the tool works without it, so it is kept out of
+# requirements.txt: the offline suite, `validate` and `build` must never need a driver.
+-r requirements.txt
+psycopg[binary]>=3.1

@@ -241,6 +241,17 @@
     - ST_MakeValid
     - ST_AsMVT
   tags: [simplify, topology, generalisation, geos, tiles]
+  verify:
+    mode: geos-sensitive
+    reason: >-
+      The exact WKT of the topo column depends on the GEOS version. Verified against
+      the CI matrix: GEOS 3.9.0 (the 14-3.3, 15-3.4, 16-3.4 and 17-3.5 images) returns
+      POLYGON((0 0,10 0,10 10,0 10,0 0)), the unchanged square shown above, while
+      GEOS 3.13.1 (the 18-3.6 image) simplifies further to the triangle
+      POLYGON((0 10,10 0,10 10,0 10)). Both outputs make the point the example
+      exists to make - plain ST_Simplify returns NULL at this tolerance while
+      ST_SimplifyPreserveTopology returns a valid, non-empty polygon - so the
+      contrast is asserted and only the literal vertex list is exempt.
 
 - name: ST_Union
   category: processing
