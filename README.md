@@ -377,6 +377,15 @@ corrections — mostly `since` versions (`Availability:` and `Changed:` mean dif
 a rename is not an introduction) and missing overloads in signatures. Every stated SQL result was
 recomputed by hand and none needed changing.
 
+All 92 SQL examples have since been *executed* against a live PostGIS 3.4.3 / PostgreSQL 16
+(GEOS 3.9.0, PROJ 7.2.1), each in its own rolled-back transaction. 90 reproduced their stated
+result exactly. The two that did not are `PostGIS_Full_Version` and `PostGIS_GEOS_Version`, whose
+stated output quotes a newer stack (GEOS 3.12.1, PROJ 9.4.0) than that test box runs; those are
+environment artifacts, not errors, and were deliberately left alone. No example needed a
+correction. The examples are written defensively — rounded magnitudes, feature counts and boolean
+assertions rather than raw coordinate dumps — which is why GEOS-sensitive entries such as
+`ST_Buffer`, `ST_ConcaveHull` and `ST_VoronoiPolygons` reproduce unchanged on an older GEOS.
+
 What that verification can and cannot back:
 
 - **Signatures, return types, `since` versions and documented behaviour** are doc-sourced. Where
@@ -385,8 +394,13 @@ What that verification can and cannot back:
 - **`index_usage` and much of `srid_notes` are editorial.** The upstream pages mostly do not
   discuss GiST behaviour or sargability, so these reflect PostGIS practice rather than quotable
   documentation. They are the fields most worth confirming against `EXPLAIN` on your own version
-  before you rely on them. `ST_Equals` is marked conservatively for exactly this reason: its page,
-  alone among the predicates, states no automatic bounding-box comparison.
+  before you rely on them. The `gist: true` predicates and the `gist: false` markings on
+  `ST_Disjoint` and `ST_Relate` have since been confirmed empirically with `EXPLAIN ANALYZE`
+  against PostGIS 3.4.3 over a GiST-indexed fixture table. `ST_Equals` was previously marked
+  conservatively on the grounds that its page, alone among the predicates, states no automatic
+  bounding-box comparison; that marking turned out to be wrong. It carries the same
+  `postgis_index_supportfn` as `ST_Intersects` and emits a `~=` (identical bounding box) index
+  condition, so it is index-assisted and is now marked as such.
 - **Claims that quote a literal error message** were dropped unless the wording could be
   confirmed, and the underlying lesson kept instead. An invented error string is worse than no
   error string, because it looks checkable.

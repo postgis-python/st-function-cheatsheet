@@ -896,16 +896,19 @@
     use ST_SnapToGrid on both sides first, or compare ST_Distance against a tolerance rather
     than relying on exact equality.
   index_usage:
-    gist: false
-    sargable: false
-    needs_bbox_prefilter: true
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
     notes: >-
-      Unlike the other predicates in this category, the ST_Equals documentation page carries
-      no statement about an automatic bounding-box comparison, so do not assume it is
-      index-assisted; check EXPLAIN on your own version before relying on it. Adding an
-      explicit && prefilter is the safe way to force a box comparison. Note that the =
-      operator on geometry is a different thing entirely - it compares serialised
-      representations and is what btree indexes and DISTINCT use.
+      Index-assisted, despite the documentation page being silent about it. ST_Equals carries
+      the same postgis_index_supportfn as ST_Intersects, and the term it emits is ~= (identical
+      bounding box) rather than the && used by the other predicates - a tighter filter, since
+      two equal geometries must have the same box. Verified on PostGIS 3.4.3 with EXPLAIN
+      ANALYZE over a 5000-row GiST-indexed table: "Bitmap Index Scan on cells_gix, Index Cond:
+      (geom ~= '...'::geometry)". An explicit && prefilter is therefore redundant. Note that the
+      = operator on geometry is a different thing entirely - it compares serialised
+      representations and is what btree indexes and DISTINCT use. Contrast ST_Disjoint and
+      ST_Relate, which genuinely have no support function and always scan.
   common_mistakes:
     - "Confusing ST_Equals with the = operator. The former is spatial, the latter is byte-level, and they disagree on reversed or renumbered rings."
     - "Expecting it to survive a round trip through ST_Transform, where floating-point drift breaks exact equality."
