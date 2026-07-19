@@ -1,0 +1,793 @@
+# Measurement functions: areas, lengths, distances, bearings and linear referencing.
+# This is where degrees-vs-metres bites hardest - read every srid_notes block twice.
+
+- name: ST_Area
+  category: measurement
+  signatures:
+    - "ST_Area(geometry g) -> double precision"
+    - "ST_Area(geography geog, boolean use_spheroid = true) -> double precision"
+  summary: >-
+    Returns the area of the surface of a polygonal geometry, and zero for anything
+    without a surface - points, linestrings and empty geometries all measure 0. You
+    reach for it whenever you need a magnitude to rank, weight or aggregate by:
+    largest parcels first, population per square kilometre, or the overlap area
+    produced by ST_Intersection. The units are the units of the coordinate system,
+    which is the single most common source of nonsense numbers in a PostGIS codebase.
+  returns: double precision
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: The geometry to measure. Non-areal inputs return 0 rather than erroring.
+    - name: use_spheroid
+      type: boolean
+      description: Geography form only. True measures on the WGS84 spheroid, false on a sphere (faster, slightly less accurate).
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_Area('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry) AS box_area,
+             ST_Area('LINESTRING(0 0, 10 10)'::geometry) AS line_area;
+    result: |2-
+       box_area | line_area
+      ----------+-----------
+            100 |         0
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_Area(ST_Transform(geom, 3035)) / 10000.0 AS hectares
+              FROM parcels
+              WHERE owner_id = %s
+              ORDER BY hectares DESC
+              """,
+              (owner_id,),
+          )
+          parcel_sizes = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Area, ST_Transform
+
+      hectares = (ST_Area(ST_Transform(Parcel.geom, 3035)) / 10000.0).label("hectares")
+      stmt = select(Parcel.id, hectares).order_by(hectares.desc())
+  srid_notes: >-
+    On geometry the result is in squared SRID units. On SRID 4326 that means square
+    degrees, a quantity with no physical meaning - a square degree is roughly 12300
+    square kilometres at the equator and shrinks towards the poles. For real areas
+    either ST_Transform to an equal-area projection appropriate to your extent (3035
+    for Europe, 5070 for the contiguous US, 6933 globally) or cast to geography,
+    where ST_Area returns square metres on the spheroid by default. Do not use Web
+    Mercator (3857) for area: it is conformal, not equal-area, and inflates areas by
+    a factor of about 1/cos(latitude) squared, roughly doubling them at 45 degrees.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      A per-row computation, never index-assisted. Filtering on ST_Area(geom) > x
+      forces a full scan unless you add an expression index on that exact expression,
+      or materialise the area into a stored generated column.
+  common_mistakes:
+    - "Computing ST_Area directly on 4326 geometry and reporting the square degrees as if they were an area."
+    - "Using ST_Transform(geom, 3857) for area calculations; Web Mercator badly overstates area away from the equator."
+    - "Calling ST_Area on a linestring or a boundary and being surprised by 0 - that is ST_Length's job."
+    - "Forgetting that ST_Area(geography) defaults to use_spheroid = true, then wondering why it is slower than the sphere-based number a colleague computed."
+  see_also:
+    - ST_Perimeter
+    - ST_Length
+    - ST_Transform
+    - ST_Intersection
+    - ST_Envelope
+  tags: [area, measurement, units, projection, polygon]
+
+- name: ST_Length
+  category: measurement
+  signatures:
+    - "ST_Length(geometry a_2dlinestring) -> double precision"
+    - "ST_Length(geography geog, boolean use_spheroid = true) -> double precision"
+  summary: >-
+    Returns the 2D length of a linear geometry: the sum of its segment lengths for a
+    LINESTRING, or of all component lengths for a MULTILINESTRING. It is the workhorse
+    for route distances, pipe and cable inventories, and stream network statistics.
+    The important trap is that for a polygon input the geometry form returns 0, not
+    the perimeter - PostGIS deliberately reserves perimeter measurement for
+    ST_Perimeter. Areal inputs and points therefore always measure 0.
+  returns: double precision
+  since: "1.0"
+  arguments:
+    - name: a_2dlinestring
+      type: geometry
+      description: The linear geometry to measure. Polygons and points return 0.
+    - name: use_spheroid
+      type: boolean
+      description: Geography form only. True measures on the WGS84 spheroid, false on a sphere.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_Length('LINESTRING(0 0, 3 4)'::geometry) AS line_len,
+             ST_Length('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry) AS poly_len;
+    result: |2-
+       line_len | poly_len
+      ----------+----------
+              5 |        0
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT route_id, ST_Length(geom::geography) / 1000.0 AS km
+              FROM bus_routes
+              WHERE agency = %s
+              ORDER BY km DESC
+              LIMIT %s
+              """,
+              (agency, limit),
+          )
+          longest_routes = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import cast, select
+      from geoalchemy2 import Geography
+      from geoalchemy2.functions import ST_Length
+
+      km = (ST_Length(cast(BusRoute.geom, Geography)) / 1000.0).label("km")
+      stmt = select(BusRoute.route_id, km).order_by(km.desc()).limit(10)
+  srid_notes: >-
+    The geometry form returns SRID units, so on 4326 you get degrees - a diagonal
+    "length" of 0.9 means nothing on the ground. Casting to geography changes the
+    answer to metres measured along the geodesic on the WGS84 spheroid, which is
+    almost always what you actually wanted for lat/lon data. On a projected CRS the
+    number is in that CRS's linear unit, and remember some state-plane and US survey
+    systems are in feet, not metres, so check the unit in spatial_ref_sys before
+    dividing by 1000. Web Mercator lengths are inflated by roughly 1/cos(latitude)
+    and should never be reported as ground distances.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Per-row computation with no index support. The geography cast makes it markedly
+      more expensive per row, so precompute length_m into a column if you filter or
+      sort on it regularly.
+  common_mistakes:
+    - "Expecting ST_Length on a polygon to give the perimeter; it returns 0. Use ST_Perimeter, or ST_Length(ST_Boundary(geom))."
+    - "Reporting ST_Length of a 4326 geometry as metres when it is degrees."
+    - "Assuming a projected SRID is metric - several US state plane systems return US survey feet."
+  see_also:
+    - ST_Perimeter
+    - ST_Distance
+    - ST_Boundary
+    - ST_Segmentize
+    - ST_Transform
+  tags: [length, measurement, linestring, units, geography]
+
+- name: ST_Perimeter
+  category: measurement
+  signatures:
+    - "ST_Perimeter(geometry g1) -> double precision"
+    - "ST_Perimeter(geography geog, boolean use_spheroid = true) -> double precision"
+  summary: >-
+    Returns the total length of the boundary of an areal geometry, including the
+    boundaries of any interior rings. It exists precisely because ST_Length refuses to
+    measure polygons, and it is what you want for fencing estimates, coastline
+    lengths, or shape-compactness metrics such as the Polsby-Popper ratio. Non-areal
+    inputs - points and linestrings - return 0, which is the mirror image of
+    ST_Length's behaviour on polygons.
+  returns: double precision
+  since: "1.0"
+  arguments:
+    - name: g1
+      type: geometry
+      description: The polygonal geometry to measure. Points and linestrings return 0.
+    - name: use_spheroid
+      type: boolean
+      description: Geography form only. True measures on the WGS84 spheroid, false on a sphere.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_Perimeter('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry) AS outer_only,
+             ST_Perimeter('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0),(2 2, 2 4, 4 4, 4 2, 2 2))'::geometry) AS with_hole;
+    result: |2-
+       outer_only | with_hole
+      ------------+-----------
+               40 |        48
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT lake_id,
+                     ST_Perimeter(geom::geography) / 1000.0 AS shoreline_km
+              FROM lakes
+              WHERE basin = %s
+              """,
+              (basin,),
+          )
+          shorelines = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import cast, select
+      from geoalchemy2 import Geography
+      from geoalchemy2.functions import ST_Perimeter
+
+      shoreline_km = (ST_Perimeter(cast(Lake.geom, Geography)) / 1000.0).label("shoreline_km")
+      stmt = select(Lake.lake_id, shoreline_km)
+  srid_notes: >-
+    Same unit rules as ST_Length: SRID units for geometry, metres for geography.
+    Perimeter is far more sensitive to projection distortion than area comparisons
+    suggest, because it is dominated by the finest vertices; reprojecting a
+    high-resolution coastline between CRSs will shift the number by a noticeable
+    fraction. Compactness ratios that mix ST_Perimeter and ST_Area must compute both
+    in the same CRS or the dimensionless ratio is meaningless - a squared-degree area
+    over a degree perimeter is not a shape index.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      No index support. On heavily vertexed polygons it is proportional to vertex
+      count, so ST_Simplify first if you only need an approximate figure for ranking.
+  common_mistakes:
+    - "Assuming holes are excluded; interior ring boundaries are included in the total."
+    - "Calling it on a MULTILINESTRING expecting the line length - it returns 0, use ST_Length."
+    - "Mixing CRSs when building perimeter-to-area shape indices, which silently produces uncomparable numbers."
+  see_also:
+    - ST_Length
+    - ST_Area
+    - ST_Boundary
+    - ST_Simplify
+  tags: [perimeter, measurement, polygon, units, boundary]
+
+- name: ST_Distance
+  category: measurement
+  signatures:
+    - "ST_Distance(geometry g1, geometry g2) -> double precision"
+    - "ST_Distance(geography geog1, geography geog2, boolean use_spheroid = true) -> double precision"
+  summary: >-
+    Returns the minimum distance between two geometries - the length of the shortest
+    line joining them, which is 0 whenever they touch or intersect. It is the general
+    measurement primitive behind proximity reports, nearest-facility summaries and
+    quality checks on how far a geocoded point strayed from its street. Note that it
+    measures between the closest points of the whole geometries, not between
+    centroids, so a point inside a polygon is at distance 0 from it.
+  returns: double precision
+  since: "1.0"
+  arguments:
+    - name: g1
+      type: geometry
+      description: First geometry. Must share an SRID with g2.
+    - name: g2
+      type: geometry
+      description: Second geometry.
+    - name: use_spheroid
+      type: boolean
+      description: Geography form only. True measures on the WGS84 spheroid, false on a sphere.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_Distance('POINT(0 0)'::geometry, 'POINT(3 4)'::geometry) AS planar,
+             ST_Distance('POINT(0 0)'::geometry, 'POLYGON((-1 -1, -1 1, 1 1, 1 -1, -1 -1))'::geometry) AS inside;
+    result: |2-
+       planar | inside
+      --------+--------
+            5 |      0
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT h.id, ST_Distance(h.geom::geography, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography) AS metres
+              FROM hospitals h
+              WHERE ST_DWithin(h.geom::geography, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
+              ORDER BY metres
+              """,
+              (lon, lat, lon, lat, radius_m),
+          )
+          nearby = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import cast, select
+      from geoalchemy2 import Geography
+      from geoalchemy2.functions import ST_Distance, ST_DWithin, ST_MakePoint, ST_SetSRID
+
+      here = cast(ST_SetSRID(ST_MakePoint(lon, lat), 4326), Geography)
+      metres = ST_Distance(cast(Hospital.geom, Geography), here).label("metres")
+      stmt = select(Hospital.id, metres).where(
+          ST_DWithin(cast(Hospital.geom, Geography), here, radius_m)
+      ).order_by(metres)
+  srid_notes: >-
+    The geometry form is planar and returns SRID units, so on 4326 the answer is
+    degrees and is anisotropic - one degree of longitude is about 111 km at the
+    equator but only about 79 km at 45 degrees north, so degree distances compare
+    badly across latitudes. The geography form returns metres computed on the
+    spheroid and handles the antimeridian and long distances correctly. Mixed SRIDs
+    raise an error rather than reprojecting; if the two columns differ, wrap the
+    non-indexed side in ST_Transform, never the indexed one.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      ST_Distance itself is never index-assisted. Bound the candidate set with
+      ST_DWithin (which is), or use the <-> KNN operator in ORDER BY with a LIMIT,
+      then compute ST_Distance only on the survivors.
+  common_mistakes:
+    - "Writing WHERE ST_Distance(a, b) < 1000, which scans the whole table; use ST_DWithin instead."
+    - "Interpreting the 4326 geometry result as metres, or multiplying degrees by a fixed 111320 across a wide latitude range."
+    - "Casting to geography inside a hot loop over millions of rows when a projected column would be far cheaper."
+  see_also:
+    - ST_DWithin
+    - "<->"
+    - ST_DistanceSphere
+    - ST_ShortestLine
+    - ST_3DDistance
+  tags: [distance, measurement, proximity, geography, units]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: ST_DistanceSphere
+  category: measurement
+  signatures:
+    - "ST_DistanceSphere(geometry geomlonlatA, geometry geomlonlatB, float8 radius = 6371008) -> double precision"
+  summary: >-
+    Returns the great-circle distance in metres between two lon/lat geometries,
+    treating the Earth as a sphere. It is the cheap middle ground between the
+    meaningless degree distance of planar ST_Distance on 4326 and the full spheroidal
+    computation: typically within about 0.3 percent of the ellipsoidal answer, at a
+    fraction of the cost. Use it for ad-hoc analysis, sanity checks and any ranking
+    where sub-percent accuracy does not matter. It was named ST_Distance_Sphere before
+    PostGIS 2.2.
+  returns: double precision
+  since: "1.5 (renamed from ST_Distance_Sphere in 2.2)"
+  arguments:
+    - name: geomlonlatA
+      type: geometry
+      description: First geometry, interpreted as longitude/latitude degrees.
+    - name: geomlonlatB
+      type: geometry
+      description: Second geometry, interpreted as longitude/latitude degrees.
+  example:
+    sql: |-
+      SELECT ROUND(
+               ST_DistanceSphere('POINT(0 0)'::geometry, 'POINT(1 0)'::geometry)::numeric / 1000, 1
+             ) AS km;
+    result: |2-
+         km
+      -------
+       111.2
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_DistanceSphere(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326)) AS metres
+              FROM weather_stations
+              ORDER BY metres
+              LIMIT 5
+              """,
+              (lon, lat),
+          )
+          closest_stations = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_DistanceSphere, ST_MakePoint, ST_SetSRID
+
+      here = ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+      metres = ST_DistanceSphere(WeatherStation.geom, here).label("metres")
+      stmt = select(WeatherStation.id, metres).order_by(metres).limit(5)
+  srid_notes: >-
+    Inputs are always interpreted as longitude then latitude in degrees, regardless of
+    the SRID actually attached to the geometry - feeding it projected metres from 3857
+    produces a large, silently wrong number rather than an error. Always ST_Transform
+    to 4326 first if your column is projected. The output is metres no matter what,
+    which makes it the odd one out among the measurement functions: it neither honours
+    the SRID units nor requires a geography cast. Since 1.5 it accepts lines and polygons
+    as well as points, measuring the true minimum great-circle distance between them
+    rather than reducing them to centroids.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      Not index-assisted and there is no sphere-based equivalent of ST_DWithin. Bound
+      the search with ST_DWithin on a geography cast or an ST_Expand box first, then
+      measure.
+  common_mistakes:
+    - "Passing projected coordinates (3857, UTM, state plane) and getting a plausible-looking but nonsense metre value."
+    - "Passing latitude first. The argument order is longitude, latitude - the opposite of how most people say a coordinate aloud."
+    - "Assuming it is point-only. Versions before PostGIS 1.5 were, which is where that reputation comes from, but current versions measure lines and polygons properly."
+  see_also:
+    - ST_DistanceSpheroid
+    - ST_Distance
+    - ST_DWithin
+    - ST_Transform
+  tags: [distance, sphere, great-circle, metres, lonlat]
+
+- name: ST_DistanceSpheroid
+  category: measurement
+  signatures:
+    - "ST_DistanceSpheroid(geometry geomlonlatA, geometry geomlonlatB) -> double precision"
+    - "ST_DistanceSpheroid(geometry geomlonlatA, geometry geomlonlatB, spheroid measurement_spheroid) -> double precision"
+  summary: >-
+    Returns the distance in metres between two lon/lat geometries measured on a
+    reference ellipsoid, using Vincenty-style geodesic computation. It is the most
+    accurate of the distance functions for geographic coordinates and the one to use
+    when you need survey-grade numbers or must match another system's ellipsoid
+    exactly. The optional spheroid argument lets you specify a datum other than WGS84,
+    which matters when working with legacy national grids. It was named
+    ST_Distance_Spheroid before PostGIS 2.2.
+  returns: double precision
+  since: "1.5 (renamed from ST_Distance_Spheroid in 2.2)"
+  arguments:
+    - name: geomlonlatA
+      type: geometry
+      description: First geometry, interpreted as longitude/latitude degrees.
+    - name: geomlonlatB
+      type: geometry
+      description: Second geometry, interpreted as longitude/latitude degrees.
+    - name: measurement_spheroid
+      type: spheroid
+      description: 'Reference ellipsoid, e.g. SPHEROID["WGS 84",6378137,298.257223563]. Defaults to WGS84 when omitted.'
+      optional: true
+  example:
+    sql: |-
+      SELECT ROUND(
+               ST_DistanceSpheroid(
+                 'POINT(0 0)'::geometry,
+                 'POINT(1 0)'::geometry,
+                 'SPHEROID["WGS 84",6378137,298.257223563]'
+               )::numeric / 1000, 1
+             ) AS km;
+    result: |2-
+         km
+      -------
+       111.3
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT leg_id,
+                     ST_DistanceSpheroid(origin, destination) AS metres
+              FROM flight_legs
+              WHERE carrier = %s
+              """,
+              (carrier,),
+          )
+          leg_distances = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_DistanceSpheroid
+
+      metres = ST_DistanceSpheroid(FlightLeg.origin, FlightLeg.destination).label("metres")
+      stmt = select(FlightLeg.leg_id, metres)
+  srid_notes: >-
+    Like ST_DistanceSphere the arguments are read as longitude/latitude degrees
+    whatever SRID they carry, so projected input is silently wrong - transform to 4326
+    first. The output is always metres. Note the spheroid argument is independent of
+    the geometry's SRID: passing a Clarke 1866 spheroid to coordinates that are really
+    WGS84 lon/lat gives a distance on a datum the data does not belong to, and PostGIS
+    will not warn you. If you simply want spheroidal metres on WGS84, casting both
+    sides to geography and calling ST_Distance is equivalent and composes better with
+    ST_DWithin and the GiST index.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      No index support, and the geodesic solution is iterative so it is the slowest of
+      the distance functions. Prefilter with ST_DWithin on geography, then refine.
+  common_mistakes:
+    - "Supplying a spheroid that does not match the datum of the coordinates, producing a confidently precise wrong answer."
+    - "Using it on projected data; the inputs must be degrees."
+    - "Reaching for it when geography ST_Distance would be simpler, equally accurate on WGS84, and index-friendly via ST_DWithin."
+  see_also:
+    - ST_DistanceSphere
+    - ST_Distance
+    - ST_DWithin
+    - ST_Transform
+  tags: [distance, spheroid, geodesic, metres, accuracy]
+
+- name: ST_3DDistance
+  category: measurement
+  signatures:
+    - "ST_3DDistance(geometry g1, geometry g2) -> double precision"
+  summary: >-
+    Returns the minimum 3D Cartesian distance between two geometries, taking the Z
+    ordinate into account. Use it for anything where elevation is real separation:
+    utility conflict detection between buried and overhead assets, borehole and
+    seismic work, or clearance checks between building levels. Mixing 2D and 3D rows
+    in one table is still worth avoiding: since PostGIS 2.2 a missing Z is no longer
+    assumed to be 0, so a mixed table does not measure uniformly.
+  returns: double precision
+  since: "2.0"
+  arguments:
+    - name: g1
+      type: geometry
+      description: First geometry. Z is used when present; since PostGIS 2.2 a missing Z is not assumed to be 0.
+    - name: g2
+      type: geometry
+      description: Second geometry, same SRID as g1.
+  example:
+    sql: |-
+      SELECT ST_3DDistance('POINT(0 0 0)'::geometry, 'POINT(3 4 12)'::geometry) AS d3,
+             ST_Distance('POINT(0 0 0)'::geometry, 'POINT(3 4 12)'::geometry) AS d2;
+    result: |2-
+       d3 | d2
+      ----+----
+       13 |  5
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT a.id, b.id, ST_3DDistance(a.geom, b.geom) AS gap
+              FROM conduits a
+              JOIN conduits b ON a.id < b.id AND a.geom && b.geom
+              WHERE ST_3DDistance(a.geom, b.geom) < %s
+              """,
+              (min_clearance,),
+          )
+          conflicts = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from sqlalchemy.orm import aliased
+      from geoalchemy2.functions import ST_3DDistance
+
+      a, b = aliased(Conduit), aliased(Conduit)
+      gap = ST_3DDistance(a.geom, b.geom).label("gap")
+      stmt = select(a.id, b.id, gap).join(b, a.id < b.id).where(gap < min_clearance)
+  srid_notes: >-
+    The computation is purely Cartesian, so it is only meaningful on a projected SRID
+    where X, Y and Z share one linear unit. On 4326 it mixes degrees with whatever Z
+    is - usually metres - and produces a number that is not a distance in any system.
+    There is no geography form. Worse, ST_Transform reprojects X and Y but leaves Z
+    untouched for most transformations, so a table transformed from feet-based
+    coordinates into metres can end up with metric X/Y and imperial Z; verify the
+    vertical unit independently before trusting any 3D measurement.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      Not index-assisted. Prefilter with the n-D box operator &&& against a
+      gist_geometry_ops_nd index, or with a 2D && plus a Z-range predicate, before
+      measuring.
+  common_mistakes:
+    - "Running it on a table where some rows are 2D; since PostGIS 2.2 a missing Z is not treated as 0, so such rows do not measure consistently with the 3D ones."
+    - "Using it on 4326 data, which mixes degrees and metres into a meaningless scalar."
+    - "Assuming ST_Transform converted the Z values along with X and Y - it generally does not."
+  see_also:
+    - ST_Distance
+    - "&&&"
+    - ST_Force2D
+    - ST_Transform
+  tags: [distance, 3d, measurement, elevation, cartesian]
+
+- name: ST_Azimuth
+  category: measurement
+  signatures:
+    - "ST_Azimuth(geometry origin, geometry target) -> double precision"
+    - "ST_Azimuth(geography origin, geography target) -> double precision"
+  summary: >-
+    Returns the bearing from the origin point to the target point, measured in radians
+    clockwise from north, in the range 0 to 2*pi. It is the building block for
+    orientation analysis - which way a driveway faces, the heading between consecutive
+    GPS fixes, or rotating a symbol to align with a road segment. Both arguments must
+    be points; the result is undefined (NULL) when the two points are identical. The
+    value is radians, not degrees, so almost every real use wraps it in degrees().
+  returns: double precision
+  since: "1.1 (geography form since 2.0)"
+  arguments:
+    - name: origin
+      type: geometry
+      description: The point the bearing is measured from. Must be a POINT.
+    - name: target
+      type: geometry
+      description: The point the bearing is measured to. Must be a POINT.
+  example:
+    sql: |-
+      SELECT ROUND(degrees(ST_Azimuth('POINT(0 0)'::geometry, 'POINT(0 1)'::geometry))::numeric, 1) AS north,
+             ROUND(degrees(ST_Azimuth('POINT(0 0)'::geometry, 'POINT(1 0)'::geometry))::numeric, 1) AS east;
+    result: |2-
+       north | east
+      -------+------
+         0.0 | 90.0
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT fix_id,
+                     degrees(ST_Azimuth(lag_geom, geom)) AS heading_deg
+              FROM (
+                  SELECT fix_id, geom, lag(geom) OVER (PARTITION BY track_id ORDER BY ts) AS lag_geom
+                  FROM gps_fixes WHERE track_id = %s
+              ) s
+              WHERE lag_geom IS NOT NULL AND NOT ST_Equals(lag_geom, geom)
+              """,
+              (track_id,),
+          )
+          headings = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import func, select
+      from geoalchemy2.functions import ST_Azimuth
+
+      heading = func.degrees(ST_Azimuth(Segment.start_pt, Segment.end_pt)).label("heading_deg")
+      stmt = select(Segment.id, heading)
+  srid_notes: >-
+    On geometry the azimuth is the planar grid bearing in the SRID's own coordinate
+    frame, so "north" means grid north, not true north; in a UTM or state plane zone
+    the two differ by the convergence angle, up to a few degrees at the zone edges.
+    On 4326 geometry the bearing is computed on the raw degree grid, which distorts
+    badly at high latitudes. The geography form instead returns the initial bearing of
+    the geodesic - true north, correct on the spheroid - and is what you want for
+    navigation. Note a geodesic bearing changes along the path, so the reverse azimuth
+    is not simply the forward one plus pi.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Purely computational, no index involvement. If you filter on bearing ranges
+      often, store the degrees value in a plain column and index that with a btree.
+  common_mistakes:
+    - "Treating the return value as degrees. It is radians - wrap it in degrees()."
+    - "Not handling identical origin and target, which yields NULL and can poison an aggregate."
+    - "Assuming the geometry form gives true north; on a projected CRS it gives grid north, and on 4326 it gives a distorted planar bearing. Cast to geography for real bearings."
+  see_also:
+    - ST_Distance
+    - ST_LineInterpolatePoint
+    - ST_MakePoint
+    - ST_Transform
+  tags: [azimuth, bearing, radians, direction, measurement]
+
+- name: ST_LineLocatePoint
+  category: measurement
+  signatures:
+    - "ST_LineLocatePoint(geometry a_linestring, geometry a_point) -> double precision"
+    - "ST_LineLocatePoint(geography a_linestring, geography a_point, boolean use_spheroid = true) -> double precision"
+  summary: >-
+    Returns a fraction between 0 and 1 giving how far along a linestring the closest
+    point to the supplied point lies. It is the snapping half of linear referencing:
+    given a GPS fix and a road, it tells you where on the road the fix belongs, which
+    you then turn into a chainage by multiplying by ST_Length, or into a snapped
+    location with ST_LineInterpolatePoint. Use it for map matching, milepost
+    calculation, and splitting a route at an event location.
+  returns: double precision
+  since: "1.1"
+  arguments:
+    - name: a_linestring
+      type: geometry
+      description: The reference linestring. A single LINESTRING - multilinestrings are not supported.
+    - name: a_point
+      type: geometry
+      description: The point to locate. It need not lie on the line; the nearest position is used.
+  example:
+    sql: |-
+      SELECT ST_LineLocatePoint('LINESTRING(0 0, 10 0)'::geometry, 'POINT(2 0)'::geometry) AS on_line,
+             ST_LineLocatePoint('LINESTRING(0 0, 10 0)'::geometry, 'POINT(2 5)'::geometry) AS off_line;
+    result: |2-
+       on_line | off_line
+      ---------+----------
+           0.2 |      0.2
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT r.road_id,
+                     ST_LineLocatePoint(r.geom, %s::geometry) * ST_Length(r.geom::geography) AS chainage_m
+              FROM roads r
+              ORDER BY r.geom <-> %s::geometry
+              LIMIT 1
+              """,
+              (fix_ewkt, fix_ewkt),
+          )
+          road_id, chainage_m = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import cast, select
+      from geoalchemy2 import Geography
+      from geoalchemy2.functions import ST_Length, ST_LineLocatePoint
+
+      chainage = (
+          ST_LineLocatePoint(Road.geom, fix) * ST_Length(cast(Road.geom, Geography))
+      ).label("chainage_m")
+      stmt = select(Road.road_id, chainage).order_by(Road.geom.distance_centroid(fix)).limit(1)
+  srid_notes: >-
+    The returned fraction is dimensionless, which makes it the one measurement here
+    that is safe to compute in any CRS - but only the fraction. The moment you convert
+    it to a real chainage by multiplying by a length, the CRS matters again: multiply
+    by ST_Length(geom) on a 4326 column and you get degrees. Multiply by
+    ST_Length(geom::geography) for metres. The fraction itself is also not fully
+    CRS-invariant, because "closest point" is judged planar in the input's units, so a
+    perpendicular projection in 4326 degrees lands at a slightly different position
+    than the same projection computed in a local metric CRS. Both arguments must share
+    an SRID.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not index-assisted itself. The expensive part of map matching is finding the
+      candidate line, so use <-> with a LIMIT or ST_DWithin for that, then call this
+      on the shortlist.
+  common_mistakes:
+    - "Passing a MULTILINESTRING, which raises an error - merge it first, and be aware ST_LineMerge may reorder or split the parts."
+    - "Reading the result as a distance. It is a 0-1 fraction; multiply by a length to get one."
+    - "Multiplying the fraction by ST_Length of a 4326 geometry and reporting degrees as metres."
+  see_also:
+    - ST_LineInterpolatePoint
+    - ST_Length
+    - ST_ClosestPoint
+    - "<->"
+    - ST_DWithin
+  tags: [linear-referencing, fraction, snapping, linestring, measurement]
+
+- name: ST_LineInterpolatePoint
+  category: measurement
+  signatures:
+    - "ST_LineInterpolatePoint(geometry a_linestring, double precision a_fraction) -> geometry"
+    - "ST_LineInterpolatePoint(geography a_linestring, double precision a_fraction, boolean use_spheroid = true) -> geography"
+  summary: >-
+    Returns the point that lies a given fraction of the way along a linestring, where
+    the fraction runs from 0 at the start to 1 at the end. It is the inverse of
+    ST_LineLocatePoint and the tool for placing things on a route: a midpoint marker,
+    a vehicle at 40 percent of its trip, or evenly spaced labels along a river. Pair
+    it with generate_series to stamp regular stations along a line without altering
+    the line's own geometry.
+  returns: geometry (POINT)
+  since: "0.8.2 (Z and M support since 1.1.1)"
+  arguments:
+    - name: a_linestring
+      type: geometry
+      description: The reference linestring. Must be a single LINESTRING.
+    - name: a_fraction
+      type: double precision
+      description: Position along the line, from 0 (start) to 1 (end). Values outside that range raise an error.
+    - name: use_spheroid
+      type: boolean
+      description: Geography form only. True measures along the spheroid, false along a sphere.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_LineInterpolatePoint('LINESTRING(0 0, 10 0)'::geometry, 0.2)) AS at_20pct,
+             ST_AsText(ST_LineInterpolatePoint('LINESTRING(0 0, 10 0)'::geometry, 0.5)) AS midpoint;
+    result: |2-
+        at_20pct  |  midpoint
+      ------------+------------
+       POINT(2 0) | POINT(5 0)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT s.n,
+                     ST_AsText(ST_LineInterpolatePoint(t.geom, s.n / 10.0)) AS station
+              FROM trails t, generate_series(0, 10) AS s(n)
+              WHERE t.trail_id = %s
+              ORDER BY s.n
+              """,
+              (trail_id,),
+          )
+          stations = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_LineInterpolatePoint
+
+      midpoint = ST_LineInterpolatePoint(Trail.geom, 0.5).label("midpoint")
+      stmt = select(Trail.trail_id, midpoint)
+  srid_notes: >-
+    The returned point inherits the input's SRID, so it needs no reprojection to be
+    stored alongside the source line. But the fraction is measured in the input's own
+    units: on a 4326 geometry, 0.5 is halfway by degree-length, which is not halfway
+    by ground distance on a line spanning a wide latitude range. Transform to a
+    suitable projected CRS - or use the geography form, which interpolates along the
+    geodesic - when the line is long and you need a true midpoint. Interpolating in
+    Web Mercator biases the point towards the higher-latitude end for the same reason
+    it inflates lengths there.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Constructive, not a predicate, so no index applies to the call itself. If you
+      index the interpolated points for later querying, materialise them into a
+      column - an expression index on this call is rarely useful.
+  common_mistakes:
+    - "Passing a fraction outside 0-1, or a distance in metres instead of a fraction, which raises an error rather than clamping."
+    - "Feeding it a MULTILINESTRING; it only accepts a single LINESTRING."
+    - "Assuming 0.5 gives the geographic midpoint of a 4326 line - it gives the midpoint in degree space, which drifts on long or steep-latitude routes."
+  see_also:
+    - ST_LineLocatePoint
+    - ST_Length
+    - ST_Segmentize
+    - ST_ClosestPoint
+    - ST_AsText
+  tags: [linear-referencing, interpolation, point, linestring, routing]

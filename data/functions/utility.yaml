@@ -1,0 +1,289 @@
+# Introspection and housekeeping functions: what is installed, how big a geometry is, and
+# how large a table's footprint is without reading it. Values below are install-specific.
+
+- name: PostGIS_Full_Version
+  category: utility
+  signatures:
+    - "PostGIS_Full_Version() -> text"
+  summary: >-
+    Returns a single line describing every component of the running PostGIS installation
+    - the PostGIS version itself, plus the GEOS, PROJ, GDAL, libxml, libjson and
+    protobuf libraries it was linked against. It is the first thing to run when
+    diagnosing behaviour that differs between two servers, because a difference in the
+    GEOS or PROJ version explains far more overlay and reprojection discrepancies than
+    the PostGIS version does. Crucially, it is also the function that warns you when the
+    installed SQL functions are older than the shared library: after an OS-level package
+    upgrade it appends a note that the procs need upgrading, which is your cue to run
+    SELECT postgis_extensions_upgrade(). Until you do, you are running new C code behind
+    old function definitions.
+  returns: text
+  since: "1.0"
+  arguments: []
+  example:
+    sql: |-
+      SELECT PostGIS_Full_Version();
+    result: |2-
+                                    postgis_full_version
+      ----------------------------------------------------------------------------
+       POSTGIS="3.4.2 c19ce56" [EXTENSION] PGSQL="160" GEOS="3.12.1-CAPI-1.18.1"
+       PROJ="9.4.0" LIBXML="2.12.6" LIBJSON="0.17" LIBPROTOBUF="1.4.1"
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute("SELECT PostGIS_Full_Version()")
+          (banner,) = cur.fetchone()
+      if "need upgrade" in banner:
+          raise RuntimeError("Run SELECT postgis_extensions_upgrade() on this database")
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import PostGIS_Full_Version
+
+      banner = session.execute(select(PostGIS_Full_Version())).scalar_one()
+      needs_upgrade = "need upgrade" in banner
+  srid_notes: >-
+    No geometry is involved, but the PROJ version reported here decides how every
+    ST_Transform in the database behaves. PROJ 6 onwards ships different, more accurate
+    datum transformation grids than PROJ 5, so the same ST_Transform(geom, 27700) can
+    move by up to a couple of metres across a PROJ major version. Record this string
+    alongside any reprojection you bake into a migration.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not a data function; it touches no tables and no indexes. Safe to call from a
+      health check on every connection, though caching the result per process is
+      politer.
+  common_mistakes:
+    - "Reading only the POSTGIS= number and ignoring the trailing 'procs need upgrade' note, leaving the extension half-upgraded after a package update."
+    - "Confusing it with PostGIS_Version(), which returns a short version string and omits the linked library details entirely."
+    - "Comparing the string literally between environments; the exact contents vary by build options, so parse the fields you care about rather than diffing the whole line."
+    - "Assuming a matching PostGIS version means matching geometry behaviour, when a different GEOS build changes ST_Union and ST_MakeValid results."
+  see_also:
+    - PostGIS_GEOS_Version
+    - ST_MakeValid
+    - ST_Transform
+    - ST_IsValid
+  tags: [introspection, version, diagnostics, upgrade]
+
+- name: PostGIS_GEOS_Version
+  category: utility
+  signatures:
+    - "PostGIS_GEOS_Version() -> text"
+  summary: >-
+    Reports the version of the GEOS library that PostGIS is linked against. GEOS
+    implements the overlay, validity and predicate machinery behind ST_Union,
+    ST_Intersection, ST_Difference, ST_MakeValid and the DE-9IM predicates, so its
+    version is the single best predictor of whether two servers will produce identical
+    geometry from identical input. Reach for it when an overlay that works in staging
+    throws a TopologyException in production, or when deciding whether a feature that
+    requires a GEOS floor - the OverlayNG engine in 3.9, ST_ConcaveHull's rewrite in
+    3.11 - is actually available. Returning a narrower answer than PostGIS_Full_Version
+    makes it easy to assert on in a test.
+  returns: text
+  since: "1.0"
+  arguments: []
+  example:
+    sql: |-
+      SELECT PostGIS_GEOS_Version();
+    result: |2-
+       postgis_geos_version
+      ----------------------
+       3.12.1-CAPI-1.18.1
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute("SELECT PostGIS_GEOS_Version()")
+          (geos,) = cur.fetchone()
+      major, minor = (int(part) for part in geos.split("-")[0].split(".")[:2])
+      has_overlay_ng = (major, minor) >= (3, 9)
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import PostGIS_GEOS_Version
+
+      geos = session.execute(select(PostGIS_GEOS_Version())).scalar_one()
+      assert geos.startswith("3.")
+  srid_notes: >-
+    GEOS is entirely planar and CRS-unaware: it works on raw coordinate numbers and has
+    no idea whether they are degrees or metres. That is why buffering a 4326 geometry
+    produces a buffer measured in degrees, and why a topology error reported by GEOS
+    often traces back to coordinates in a projection with far more significant digits
+    than the geometry needs. Reprojecting is a PROJ concern, reported separately by
+    PostGIS_Full_Version.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Touches no tables or indexes. Useful in a migration guard or a pytest fixture that
+      skips tests depending on a GEOS floor.
+  common_mistakes:
+    - "Parsing the whole string as a semantic version. The trailing CAPI component is a separate ABI number, so split on the hyphen first."
+    - "Assuming the GEOS version follows from the PostGIS version, when the same PostGIS build can be relinked against a different GEOS by the distribution."
+    - "Upgrading GEOS underneath a running server and expecting the reported version to change without a restart of the backends."
+  see_also:
+    - PostGIS_Full_Version
+    - ST_MakeValid
+    - ST_IsValid
+    - ST_Union
+  tags: [introspection, version, geos, diagnostics]
+
+- name: ST_EstimatedExtent
+  category: utility
+  signatures:
+    - "ST_EstimatedExtent(text table_name, text geocolumn_name) -> box2d"
+    - "ST_EstimatedExtent(text schema_name, text table_name, text geocolumn_name) -> box2d"
+    - "ST_EstimatedExtent(text schema_name, text table_name, text geocolumn_name, boolean parent_only) -> box2d"
+  summary: >-
+    Returns the approximate 2D bounding box of a geometry column by reading the
+    planner's statistics in pg_statistic, without touching a single row of the table.
+    Where ST_Extent has to scan every geometry, this answers in microseconds regardless
+    of table size, which makes it the right choice for setting a map's initial viewport,
+    sizing a tile pyramid, or sanity-checking that a freshly loaded table landed where
+    you expected. The price is that the answer is an estimate derived from a sample, so
+    it can be slightly smaller or larger than the true extent. It also returns NULL when
+    no statistics exist, which is a genuine gotcha rather than an error.
+  returns: box2d
+  since: "1.0 (renamed from ST_Estimated_Extent in 2.1)"
+  arguments:
+    - name: schema_name
+      type: text
+      description: Schema containing the table. Omit to use the current search_path.
+      optional: true
+    - name: table_name
+      type: text
+      description: Name of the table. Case-sensitive - it is matched as a string against the catalogs, not parsed as an identifier.
+    - name: geocolumn_name
+      type: text
+      description: Name of the geometry column whose extent you want.
+    - name: parent_only
+      type: boolean
+      description: When true, consider only the parent table of an inheritance or partition hierarchy rather than its children. Defaults to false.
+      optional: true
+  example:
+    sql: |-
+      CREATE TABLE parcels (id int, geom geometry(Point, 27700));
+      INSERT INTO parcels
+      SELECT g, ST_SetSRID(ST_MakePoint(g, g), 27700) FROM generate_series(1, 1000) g;
+      SELECT ST_EstimatedExtent('public', 'parcels', 'geom') IS NULL AS before_analyze;
+    result: |2-
+       before_analyze
+      ----------------
+       t
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT ST_EstimatedExtent(%s, %s, %s)::text",
+              ("public", "parcels", "geom"),
+          )
+          (extent,) = cur.fetchone()
+      if extent is None:
+          raise RuntimeError("parcels has never been ANALYZEd; run ANALYZE parcels")
+    geoalchemy: |-
+      from sqlalchemy import cast, select, String
+      from geoalchemy2.functions import ST_EstimatedExtent
+
+      stmt = select(cast(ST_EstimatedExtent("public", "parcels", "geom"), String))
+      extent = session.execute(stmt).scalar_one_or_none()
+  srid_notes: >-
+    The returned box2d carries no SRID at all - it is four bare numbers in the column's
+    native coordinate system. If you need a geometry in a different CRS, wrap it as
+    ST_Transform(ST_SetSRID(ST_EstimatedExtent(...)::geometry, 27700), 4326), supplying
+    the source SRID yourself. Note that transforming a bounding box is not the same as
+    the bounding box of the transformed data: reprojecting only the four corners
+    understates the extent wherever the projection curves, so for large areas
+    ST_Segmentize the box edges first or accept the approximation.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Reads pg_statistic only, so it needs neither a GiST index nor a table scan. Those
+      statistics are populated by ANALYZE, which autovacuum runs on its own schedule -
+      after a bulk load, run ANALYZE explicitly rather than waiting, since a stale
+      extent also means the planner's spatial selectivity estimates are stale.
+  common_mistakes:
+    - "Treating a NULL result as an error or an empty table. It almost always means the table has never been ANALYZEd, or that autovacuum has not yet caught up after a bulk load."
+    - "Passing a quoted or mixed-case table name incorrectly. The arguments are strings matched against the catalogs, so a table created as \"Parcels\" must be passed as 'Parcels', not 'parcels'."
+    - "Using it where exactness matters. It is a statistical estimate; use ST_Extent when the value must be exact, and accept the full scan."
+    - "Forgetting parent_only on partitioned tables, then being surprised the extent covers all partitions rather than the one you had in mind."
+  see_also:
+    - ST_Envelope
+    - ST_MakeEnvelope
+    - ST_Transform
+    - ST_SetSRID
+  tags: [statistics, extent, estimation, performance, introspection]
+  docs_url: https://www.postgis-python.com/spatial-performance-monitoring-and-observability/
+
+- name: ST_MemSize
+  category: utility
+  signatures:
+    - "ST_MemSize(geometry geom) -> integer"
+  summary: >-
+    Returns the number of bytes a geometry occupies in its serialised PostGIS form. It
+    is the practical way to find out which rows are making a table enormous, because
+    geometry storage is dominated by vertex count and a handful of pathological
+    multipolygons can outweigh millions of points. Use it to rank candidates for
+    ST_Subdivide or ST_SimplifyPreserveTopology, to spot geometries large enough to be
+    TOASTed and therefore slow to detoast on every predicate, and to measure whether a
+    simplification pass actually paid for itself. It reports the geometry's own size,
+    not the on-disk page footprint, so it will not match pg_total_relation_size
+    arithmetic exactly.
+  returns: integer
+  since: "2.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The geometry to measure. The result scales with vertex count and with the number of ordinates per vertex.
+  example:
+    sql: |-
+      SELECT ST_MemSize('POINT(1 2)'::geometry)
+             < ST_MemSize(ST_Buffer('POINT(1 2)'::geometry, 1, 8)) AS buffer_is_larger;
+    result: |2-
+       buffer_is_larger
+      ------------------
+       t
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT gid, ST_NPoints(geom), ST_MemSize(geom)
+              FROM coastlines
+              ORDER BY ST_MemSize(geom) DESC
+              LIMIT %s
+              """,
+              (limit,),
+          )
+          worst_offenders = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import desc, select
+      from geoalchemy2.functions import ST_MemSize, ST_NPoints
+
+      size = ST_MemSize(Coastline.geom).label("bytes")
+      stmt = select(Coastline.gid, ST_NPoints(Coastline.geom), size).order_by(
+          desc(size)
+      ).limit(limit)
+  srid_notes: >-
+    Size is independent of the SRID's units, but not of the SRID's precision demands: a
+    geometry stored in a projected CRS with metre-scale coordinates often survives
+    ST_SnapToGrid or ST_RemoveRepeatedPoints far better than the same shape in degrees,
+    where nearly identical vertices are harder to spot. Reprojecting with ST_Transform
+    does not change the vertex count and so barely changes ST_MemSize; if you want a
+    smaller geometry you have to remove vertices, not move them.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not indexable, and ordering by it forces a scan - fine as a one-off audit query,
+      not as part of a hot path. Its diagnostic value is index-adjacent: very large
+      geometries make GiST leaf entries expensive to recheck, so the rows it surfaces
+      are usually the same rows that make spatial joins slow.
+  common_mistakes:
+    - "Expecting it to match pg_column_size or pg_total_relation_size. It measures the geometry value alone, excluding row overhead, TOAST compression and index storage."
+    - "Comparing byte counts across PostGIS major versions as if they were stable; the serialisation format has changed between releases."
+    - "Measuring but not acting - the point of the ranking is to feed ST_Subdivide or a simplification pass, not to produce a report."
+  see_also:
+    - ST_NPoints
+    - ST_Subdivide
+    - ST_SimplifyPreserveTopology
+    - ST_RemoveRepeatedPoints
+  tags: [size, storage, diagnostics, performance, introspection]

@@ -1,0 +1,856 @@
+# Accessors: functions that interrogate a geometry rather than change it. They are how you
+# find out what you actually have in a column - type, validity, SRID, extent, part count.
+
+- name: ST_SRID
+  category: accessors
+  signatures:
+    - "ST_SRID(geometry) -> integer"
+  summary: >-
+    Returns the spatial reference identifier stored on a geometry value. Every PostGIS
+    geometry carries its own SRID as part of the value, not just as a column constraint,
+    so this is the only reliable way to find out what coordinate system a particular row
+    is really in. You reach for it when auditing an imported table, when a distance or
+    overlay operation errors out with a mixed-SRID complaint, or before deciding whether
+    a ST_Transform is needed at all.
+  returns: integer
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: The geometry (or geography) whose SRID you want to read.
+  example:
+    sql: |-
+      SELECT ST_SRID(ST_SetSRID(ST_MakePoint(-0.12, 51.5), 4326)) AS srid;
+    result: |2-
+       srid
+      ------
+       4326
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT ST_SRID(geom) AS srid, count(*) FROM imports.raw_parcels GROUP BY 1"
+          )
+          srid_histogram = dict(cur.fetchall())
+    geoalchemy: |-
+      from sqlalchemy import func, select
+      from geoalchemy2.functions import ST_SRID
+
+      stmt = (
+          select(ST_SRID(RawParcel.geom).label("srid"), func.count())
+          .group_by("srid")
+      )
+  srid_notes: >-
+    A geometry with no SRID reports 0, not NULL - so a "SRID = 0" row is unknown, not
+    WGS84, and any function that assumes degrees will quietly produce nonsense. The
+    number is only a lookup key into spatial_ref_sys; ST_SRID never validates that the
+    entry exists, and setting it with ST_SetSRID relabels the value without moving a
+    single coordinate. Geography values always report 4326 in practice, since that is
+    the only SRID the type fully supports.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not an indexable predicate. Grouping a large table by ST_SRID(geom) reads every
+      row; if you need this often, add a typmod or CHECK constraint so the SRID is a
+      schema fact rather than something you have to scan for.
+  common_mistakes:
+    - "Treating SRID 0 as WGS84. It means 'unknown', and ST_Distance on it returns degrees-as-units, not metres."
+    - "Using ST_SetSRID to fix wrongly projected data. It changes the label only - ST_Transform changes the coordinates."
+    - "Assuming a column typmod of geometry(Point,4326) guarantees the value; it does, but a plain geometry column can hold a different SRID in every row."
+  see_also:
+    - ST_SetSRID
+    - ST_Transform
+    - ST_GeometryType
+    - ST_Envelope
+  tags: [srid, crs, metadata, introspection]
+  docs_url: https://www.postgis-python.com/spatial-schema-migrations-and-evolution/
+
+- name: ST_GeometryType
+  category: accessors
+  signatures:
+    - "ST_GeometryType(geometry) -> text"
+  summary: >-
+    Returns the geometry's type name in SQL-MM spelling, with an ST_ prefix and mixed
+    case - 'ST_Point', 'ST_LineString', 'ST_MultiPolygon'. It is the standard way to
+    branch on what a row actually holds, which matters most in tables typed as bare
+    geometry where points, lines and collections can coexist. Use it in CASE expressions,
+    in CHECK constraints, and in the WHERE clause of the cleanup queries you write before
+    adding a typmod to a column.
+  returns: text
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: The geometry to inspect.
+  example:
+    sql: |-
+      SELECT ST_GeometryType('POINT(0 0)'::geometry) AS st_type,
+             GeometryType('POINT(0 0)'::geometry) AS old_type;
+    result: |2-
+       st_type  | old_type
+      ----------+----------
+       ST_Point | POINT
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT id FROM features WHERE ST_GeometryType(geom) <> %s",
+              ("ST_MultiPolygon",),
+          )
+          wrong_type_ids = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_GeometryType
+
+      stmt = select(Feature.id).where(
+          ST_GeometryType(Feature.geom) != "ST_MultiPolygon"
+      )
+  srid_notes: >-
+    Type and SRID are independent parts of the same value, and this function ignores the
+    SRID entirely - a point in 4326 and a point in 3857 both return 'ST_Point'. Note
+    also that the Z/M dimensionality is not reflected here: a PointZ still reports
+    'ST_Point', so use ST_NDims or ST_Zmflag if the third ordinate matters to your
+    branching.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      No spatial index applies. If you filter by type frequently on a mixed table, a
+      plain btree expression index on ST_GeometryType(geom) works, but restructuring the
+      column with a typmod is usually the better fix.
+  common_mistakes:
+    - "Comparing against 'POINT'. ST_GeometryType returns 'ST_Point'; the unprefixed GeometryType() function is the one that returns 'POINT'."
+    - "Getting the case wrong - the comparison is case-sensitive text, so 'ST_POINT' never matches."
+    - "Expecting 'ST_MultiPolygon' for a single-polygon row loaded from a shapefile; loaders often emit plain ST_Polygon, which is why ST_Multi exists."
+  see_also:
+    - ST_Dimension
+    - ST_Multi
+    - ST_NumGeometries
+    - ST_SRID
+  tags: [type, introspection, metadata, validation]
+
+- name: ST_IsValid
+  category: accessors
+  signatures:
+    - "ST_IsValid(geometry) -> boolean"
+    - "ST_IsValid(geometry, integer) -> boolean"
+  summary: >-
+    Tests whether a geometry satisfies the OGC validity rules - no self-intersecting
+    rings, no rings crossing each other, holes inside their shell, correct ring closure.
+    Invalid polygons are the single most common cause of GEOS exceptions from ST_Union,
+    ST_Intersection and ST_Buffer, so this is the first thing to check when an overlay
+    query dies halfway through a batch. It is cheap enough to run over a whole table once
+    at import time and expensive enough that you should not call it inside a hot join.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: The geometry to test. Points and linestrings are essentially always valid.
+    - name: flags
+      type: integer
+      description: >-
+        Optional bitfield; 1 enables the "ESRI flag", which accepts self-touching rings
+        that OGC rules reject.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_IsValid('POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))'::geometry) AS ok,
+             ST_IsValid('POLYGON((0 0, 2 2, 2 0, 0 2, 0 0))'::geometry) AS bowtie;
+    result: |2-
+       ok | bowtie
+      ----+--------
+       t  | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT id FROM landuse WHERE NOT ST_IsValid(geom) ORDER BY id LIMIT %s",
+              (500,),
+          )
+          broken = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_IsValid
+
+      stmt = select(Landuse.id).where(ST_IsValid(Landuse.geom).is_(False))
+  srid_notes: >-
+    Validity is purely topological and is evaluated in the coordinate space you already
+    have, so the SRID is irrelevant to the answer - but ST_Transform can change it.
+    Reprojecting introduces floating-point rounding that occasionally turns a
+    hair's-breadth-valid polygon invalid (or the reverse), so validate after
+    reprojection, not before. There is no geography overload; cast to geometry first.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Never index-assisted, and O(n log n) in vertex count. For repeated use, store the
+      result in a boolean column maintained by a trigger, or clean the data once with
+      ST_MakeValid and add a CHECK constraint.
+  common_mistakes:
+    - "Filtering a large table with NOT ST_IsValid(geom) on every query instead of fixing the data once with ST_MakeValid."
+    - "Expecting it to explain the problem. It returns only true/false - use ST_IsValidReason or ST_IsValidDetail for the why and where."
+    - "Assuming valid means simple. A valid MultiLineString can still self-intersect; that is ST_IsSimple's territory."
+  see_also:
+    - ST_IsValidReason
+    - ST_MakeValid
+    - ST_Buffer
+    - ST_Union
+  tags: [validity, geos, data-quality, polygon]
+
+- name: ST_IsValidReason
+  category: accessors
+  signatures:
+    - "ST_IsValidReason(geometry) -> text"
+    - "ST_IsValidReason(geometry, integer) -> text"
+  summary: >-
+    Returns a human-readable explanation of why a geometry is invalid, or the literal
+    string 'Valid Geometry' when it is fine. Where ST_IsValid gives you a yes/no,
+    this gives you the diagnosis - "Self-intersection", "Ring Self-intersection",
+    "Hole lies outside shell" - usually with the offending coordinate appended. It is the
+    right tool for a data-quality report you hand to whoever produced the source data,
+    since the message tells them where to look.
+  returns: text
+  since: "1.4"
+  arguments:
+    - name: g
+      type: geometry
+      description: The geometry to diagnose.
+    - name: flags
+      type: integer
+      description: >-
+        Optional bitfield, same meaning as in ST_IsValid; 1 applies the ESRI
+        self-touching-ring allowance.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_IsValidReason('POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))'::geometry) AS reason;
+    result: |2-
+          reason
+      ----------------
+       Valid Geometry
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_IsValidReason(geom)
+              FROM building_footprints
+              WHERE NOT ST_IsValid(geom)
+              """
+          )
+          report = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_IsValid, ST_IsValidReason
+
+      stmt = (
+          select(BuildingFootprint.id, ST_IsValidReason(BuildingFootprint.geom))
+          .where(ST_IsValid(BuildingFootprint.geom).is_(False))
+      )
+  srid_notes: >-
+    The coordinate embedded in the message is in the geometry's own SRID, so a reason
+    string from a 3857 table reports metres from the origin and one from 4326 reports
+    degrees. If you want to plot those failure points on a map, parse the coordinate and
+    ST_SetSRID it to the source SRID before transforming - do not assume WGS84.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not indexable, and it does the full validity computation, so pair it with a
+      NOT ST_IsValid(geom) filter rather than computing the reason for every row.
+  common_mistakes:
+    - "Parsing the message text to drive application logic. The wording comes from GEOS and changes between versions; use ST_IsValidDetail, which returns the reason and location as separate fields."
+    - "Calling it on every row when almost all are valid, doubling the validity work already done by ST_IsValid."
+    - "Expecting NULL for valid input - it returns the string 'Valid Geometry' instead."
+  see_also:
+    - ST_IsValid
+    - ST_MakeValid
+    - PostGIS_GEOS_Version
+  tags: [validity, diagnostics, data-quality, geos]
+
+- name: ST_IsEmpty
+  category: accessors
+  signatures:
+    - "ST_IsEmpty(geometry) -> boolean"
+  summary: >-
+    Returns true when the geometry contains no coordinates at all - a POINT EMPTY,
+    an empty collection, the zero-area leftover of an ST_Intersection that did not
+    actually overlap. Empty geometries are not NULL and do not behave like NULL: they
+    survive joins, count towards row totals, and make predicates like ST_Intersects
+    return false rather than unknown. Screening with ST_IsEmpty after any overlay step
+    is what stops those ghosts from reaching your output tables.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: The geometry to test. NULL input yields NULL, not true.
+  example:
+    sql: |-
+      SELECT ST_IsEmpty('GEOMETRYCOLLECTION EMPTY'::geometry) AS empty,
+             ST_IsEmpty('POINT(0 0)'::geometry) AS pt;
+    result: |2-
+       empty | pt
+      -------+----
+       t     | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              INSERT INTO overlaps (a_id, b_id, geom)
+              SELECT a.id, b.id, ST_Intersection(a.geom, b.geom)
+              FROM zones a JOIN zones b ON a.id < b.id AND ST_Intersects(a.geom, b.geom)
+              WHERE NOT ST_IsEmpty(ST_Intersection(a.geom, b.geom))
+              """
+          )
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_IsEmpty
+
+      stmt = select(Overlap.id).where(ST_IsEmpty(Overlap.geom).is_(True))
+  srid_notes: >-
+    An empty geometry still carries an SRID, and it still participates in the mixed-SRID
+    check, so 'POINT EMPTY' with SRID 0 will error against a 4326 column just like a
+    populated one. Its bounding box, however, is undefined - ST_Envelope of an empty
+    geometry gives you an empty geometry back, and it contributes nothing to an extent
+    aggregate.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Empty geometries have no box, so a GiST index effectively ignores them: they will
+      never be returned by a && scan. That is a common reason a row "disappears" from a
+      spatial query but still shows up in a count.
+  common_mistakes:
+    - "Using IS NULL to catch them. An empty geometry is a perfectly good non-NULL value."
+    - "Assuming ST_Area(geom) = 0 is equivalent. A zero-area but non-empty sliver polygon fails that test differently and still has vertices."
+    - "Not screening ST_Intersection results, then storing thousands of empty geometries that quietly never match any later spatial query."
+  see_also:
+    - ST_Intersection
+    - ST_NPoints
+    - ST_Envelope
+    - ST_IsValid
+  tags: [empty, null-handling, data-quality, introspection]
+
+- name: ST_NPoints
+  category: accessors
+  signatures:
+    - "ST_NPoints(geometry) -> integer"
+  summary: >-
+    Counts every vertex in the geometry, across all rings and all sub-geometries. It is
+    the fastest proxy you have for how expensive a row will be to process: overlay,
+    buffering and serialisation costs all scale with vertex count, so a table with a few
+    hundred-thousand-point coastline polygons behaves nothing like its row count
+    suggests. Use it to find the outliers worth running through ST_Subdivide or
+    ST_SimplifyPreserveTopology before they dominate your query time.
+  returns: integer
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: Any geometry; the count includes repeated and closing points.
+  example:
+    sql: |-
+      SELECT ST_NPoints('LINESTRING(0 0, 1 1, 2 2)'::geometry) AS n;
+    result: |2-
+       n
+      ---
+       3
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_NPoints(geom) AS n
+              FROM coastlines
+              ORDER BY n DESC
+              LIMIT %s
+              """,
+              (20,),
+          )
+          heaviest = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import desc, select
+      from geoalchemy2.functions import ST_NPoints
+
+      n = ST_NPoints(Coastline.geom).label("n")
+      stmt = select(Coastline.id, n).order_by(desc(n)).limit(20)
+  srid_notes: >-
+    Vertex count is invariant under ST_Transform - reprojecting never adds or removes
+    points, it only moves them - so the number is a stable complexity metric across
+    coordinate systems. The one exception is ST_Segmentize, which is often applied
+    alongside reprojection to keep great-circle edges from becoming straight lines; that
+    does inflate the count, sometimes dramatically.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not indexable, but very cheap - it reads the header and coordinate counts rather
+      than the coordinates themselves. Safe to compute across a whole table for a
+      one-off complexity audit.
+  common_mistakes:
+    - "Assuming ST_NumPoints is the LineString-only variant. Since PostGIS 1.4 ST_NumPoints is an alias for ST_NPoints and counts vertices of any geometry type."
+    - "Reading it as a distinct-vertex count. A closed ring counts its repeated first/last point twice; ST_RemoveRepeatedPoints changes the number."
+    - "Ignoring it when planning an index. Huge multipolygons make GiST boxes so loose that the index barely filters - subdivide them instead."
+  see_also:
+    - ST_Subdivide
+    - ST_SimplifyPreserveTopology
+    - ST_RemoveRepeatedPoints
+    - ST_MemSize
+  tags: [vertices, complexity, performance, introspection]
+  docs_url: https://www.postgis-python.com/advanced-gist-indexing-optimization/
+
+- name: ST_X
+  category: accessors
+  signatures:
+    - "ST_X(geometry) -> double precision"
+  summary: >-
+    Returns the X ordinate of a point geometry. It is how you get coordinates back out of
+    PostGIS as plain numbers, which is what you want when feeding a charting library, a
+    CSV export, or a Python function that expects floats rather than WKB. Because it
+    accepts only points, it is normally paired with ST_Centroid or ST_PointOnSurface when
+    the source is a line or polygon.
+  returns: double precision
+  since: "1.0"
+  arguments:
+    - name: pt
+      type: geometry
+      description: A Point geometry. Any other type raises an error; NULL returns NULL.
+  example:
+    sql: |-
+      SELECT ST_X('POINT(1 2)'::geometry) AS x, ST_Y('POINT(1 2)'::geometry) AS y;
+    result: |2-
+       x | y
+      ---+---
+       1 | 2
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT id, ST_X(geom), ST_Y(geom) FROM sensors WHERE site_id = %s",
+              (site_id,),
+          )
+          coords = {row[0]: (row[1], row[2]) for row in cur}
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_X, ST_Y
+
+      stmt = select(Sensor.id, ST_X(Sensor.geom), ST_Y(Sensor.geom)).where(
+          Sensor.site_id == site_id
+      )
+  srid_notes: >-
+    X is longitude only when the SRID is geographic; on 4326 it is degrees east, on 3857
+    or a UTM zone it is metres. Nothing in the function tells you which, so wrap it in
+    ST_Transform(geom, 4326) when you are exporting lon/lat for a web client. Watch for
+    axis-order surprises too: some CRS definitions are formally latitude-first, but
+    PostGIS always stores and returns X first regardless.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Filtering with ST_X(geom) BETWEEN ... cannot use a spatial index. Use a && test
+      against ST_MakeEnvelope instead; it expresses the same box and is index-assisted.
+  common_mistakes:
+    - "Calling it on a LineString or Polygon, which errors rather than returning the first vertex - use ST_Centroid or ST_PointOnSurface first."
+    - "Writing WHERE ST_X(geom) BETWEEN a AND b for a bounding-box filter, which throws away the GiST index."
+    - "Assuming X is longitude on a projected table, then exporting metres to a client expecting degrees."
+  see_also:
+    - ST_Y
+    - ST_Centroid
+    - ST_PointOnSurface
+    - ST_MakePoint
+    - ST_Transform
+  tags: [coordinates, point, export, introspection]
+
+- name: ST_Y
+  category: accessors
+  signatures:
+    - "ST_Y(geometry) -> double precision"
+  summary: >-
+    Returns the Y ordinate of a point geometry, the companion to ST_X. Together they are
+    the standard way to hand coordinates to application code, and they are what you use
+    when building a GeoJSON-ish payload by hand or writing latitude and longitude into
+    plain numeric columns for a downstream system that has no spatial support. As with
+    ST_X, the input must be a Point.
+  returns: double precision
+  since: "1.0"
+  arguments:
+    - name: pt
+      type: geometry
+      description: A Point geometry. Non-point input raises an error; NULL returns NULL.
+  example:
+    sql: |-
+      SELECT ST_Y(ST_Centroid('LINESTRING(0 0, 0 4)'::geometry)) AS y;
+    result: |2-
+       y
+      ---
+       2
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              UPDATE stations
+              SET lat = ST_Y(ST_Transform(geom, 4326)),
+                  lon = ST_X(ST_Transform(geom, 4326))
+              WHERE lat IS NULL
+              """
+          )
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Transform, ST_X, ST_Y
+
+      wgs = ST_Transform(Station.geom, 4326)
+      stmt = select(Station.id, ST_Y(wgs).label("lat"), ST_X(wgs).label("lon"))
+  srid_notes: >-
+    Y is latitude only on a geographic SRID; on a projected one it is a northing in
+    metres, and on some national grids it includes a false northing of millions of
+    metres. The classic bug is storing ST_Y as "lat" straight off a 3857 table and
+    getting values like 6710000. Transform to 4326 first, and remember that 3857
+    latitudes are clamped at roughly +/-85.06 degrees.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      No index support. A btree index on a materialised lat column can beat it for
+      strictly one-dimensional range queries, but any true 2D filter belongs in GiST.
+  common_mistakes:
+    - "Swapping ST_X and ST_Y when building lon/lat pairs - GeoJSON and most APIs want longitude first, which is X."
+    - "Passing a MultiPoint or Polygon and hitting 'Argument to ST_Y() must have type POINT'."
+    - "Storing a projected northing in a column named lat without transforming to 4326 first."
+  see_also:
+    - ST_X
+    - ST_Transform
+    - ST_Centroid
+    - ST_AsGeoJSON
+  tags: [coordinates, point, latitude, export]
+
+- name: ST_Envelope
+  category: accessors
+  signatures:
+    - "ST_Envelope(geometry) -> geometry"
+  summary: >-
+    Returns the minimum axis-aligned bounding rectangle of a geometry, as a real geometry
+    value rather than a box type. It is the geometry-level equivalent of what the GiST
+    index stores internally, which makes it useful for materialising a coarse index
+    column, for clipping tiles, and for explaining to yourself why a && filter matched a
+    row it "shouldn't" have. Degenerate inputs collapse gracefully: a vertical line gives
+    a LineString and a single point gives a Point.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: The geometry whose 2D extent you want. Z and M are dropped.
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_Envelope('LINESTRING(0 0, 10 5)'::geometry)) AS env;
+    result: |2-
+                       env
+      ----------------------------------
+       POLYGON((0 0,0 5,10 5,10 0,0 0))
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT ST_AsText(ST_Envelope(ST_Collect(geom))) FROM survey_plots WHERE job_id = %s",
+              (job_id,),
+          )
+          (extent_wkt,) = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Collect, ST_Envelope
+
+      stmt = select(ST_Envelope(ST_Collect(SurveyPlot.geom))).where(
+          SurveyPlot.job_id == job_id
+      )
+  srid_notes: >-
+    The envelope inherits the input's SRID and is computed in that SRID's own axes, so
+    it is only "minimal" in that coordinate system - the envelope of a reprojected
+    geometry is generally not the reprojection of the envelope. That difference bites
+    hardest on wide extents and near the poles, so transform first and take the envelope
+    second. Envelopes of data crossing the antimeridian in 4326 span the whole globe.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Computing it is cheap because the box is already cached on the value, but
+      ST_Envelope(geom) in a predicate is opaque to the planner. Index the geometry
+      column itself, or store the envelope in its own indexed column for two-stage
+      filtering on very complex polygons.
+  common_mistakes:
+    - "Using it as a substitute for the real geometry in a spatial join - the box of a river basin overlaps far more than the basin does."
+    - "Expecting a POLYGON always. A point returns a POINT and an axis-aligned line returns a LINESTRING, which breaks code that assumes four corners."
+    - "Reprojecting the envelope instead of the geometry, which produces a rectangle that no longer bounds the data."
+  see_also:
+    - ST_MakeEnvelope
+    - ST_Expand
+    - ST_EstimatedExtent
+    - "&&"
+    - ST_Boundary
+  tags: [bbox, extent, envelope, tiling]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: ST_Boundary
+  category: accessors
+  signatures:
+    - "ST_Boundary(geometry) -> geometry"
+  summary: >-
+    Returns the topological boundary of a geometry: the endpoints of a line, the rings of
+    a polygon, an empty geometry for a point. It is how you turn areas into the edges
+    that separate them, which is what you want when styling outlines, when measuring
+    shared frontage between adjacent parcels, or when snapping something onto the edge of
+    a region rather than into its interior. The result is always one dimension lower than
+    the input.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: The geometry whose boundary to compute. Closed lines return an empty MultiPoint.
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_Boundary('POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))'::geometry)) AS boundary;
+    result: |2-
+                  boundary
+      ---------------------------------
+       LINESTRING(0 0,0 1,1 1,1 0,0 0)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT ST_Length(ST_Intersection(ST_Boundary(a.geom), ST_Boundary(b.geom)))
+              FROM parcels a JOIN parcels b ON b.id = %s
+              WHERE a.id = %s
+              """,
+              (neighbour_id, parcel_id),
+          )
+          (shared_frontage,) = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Boundary, ST_Intersection, ST_Length
+
+      shared = ST_Length(ST_Intersection(ST_Boundary(a.geom), ST_Boundary(b.geom)))
+      stmt = select(shared).where(a.id == parcel_id, b.id == neighbour_id)
+  srid_notes: >-
+    The boundary keeps the input SRID, and any length you then measure on it is in that
+    SRID's units - shared frontage computed on a 4326 polygon comes out in degrees and
+    is meaningless. Transform to a local projected CRS before measuring, or cast the
+    boundary to geography, though geography has no ST_Boundary of its own so the cast
+    must come after.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      A GEOS computation over every vertex, and never index-assisted. In a join, filter
+      the pairs first with ST_Intersects or ST_Touches on the original polygons, then
+      compute boundaries only for the surviving pairs.
+  common_mistakes:
+    - "Calling it on a closed ring and being surprised by an empty result - a closed LineString has no boundary points by the OGC definition."
+    - "Assuming a polygon's boundary is a LINESTRING. A polygon with holes, or a multipolygon, returns a MULTILINESTRING."
+    - "Using it where ST_ExteriorRing was meant; ST_Boundary includes interior rings too."
+  see_also:
+    - ST_Dimension
+    - ST_Touches
+    - ST_Length
+    - ST_Intersection
+    - ST_Envelope
+  tags: [boundary, topology, rings, polygon]
+
+- name: ST_NumGeometries
+  category: accessors
+  signatures:
+    - "ST_NumGeometries(geometry) -> integer"
+  summary: >-
+    Returns how many sub-geometries a collection contains - parts of a MultiPolygon,
+    members of a GeometryCollection - and 1 for a simple geometry. Together with
+    ST_GeometryN it is the pair you use to walk a collection apart in SQL, and on its
+    own it is a quick way to spot the multipart rows that make spatial joins misbehave,
+    such as an island chain stored as one feature whose bounding box spans an ocean.
+  returns: integer
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: Any geometry. Since PostGIS 2.0 singles return 1 rather than NULL.
+  example:
+    sql: |-
+      SELECT ST_NumGeometries('MULTIPOINT((0 0),(1 1),(2 2))'::geometry) AS n;
+    result: |2-
+       n
+      ---
+       3
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_NumGeometries(geom) AS parts
+              FROM administrative_areas
+              WHERE ST_NumGeometries(geom) > %s
+              ORDER BY parts DESC
+              """,
+              (10,),
+          )
+          fragmented = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import desc, select
+      from geoalchemy2.functions import ST_NumGeometries
+
+      parts = ST_NumGeometries(AdminArea.geom).label("parts")
+      stmt = select(AdminArea.id, parts).where(parts > 10).order_by(desc(parts))
+  srid_notes: >-
+    The count is unaffected by the SRID or by reprojection. What does change with the CRS
+    is the consequence of a high part count: a multipart feature has a single bounding
+    box covering all its parts, and in 4326 a country with overseas territories gets a
+    box spanning most of the world, so its GiST entry matches almost every query. Use
+    ST_Dump to explode such rows, which helps regardless of projection.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Cheap header read, not indexable. Its real index relevance is diagnostic: high
+      part counts explain loose bounding boxes and poor GiST selectivity.
+  common_mistakes:
+    - "Expecting NULL for a non-collection. Modern PostGIS returns 1 for a single Point or Polygon."
+    - "Confusing it with ST_NPoints or its alias ST_NumPoints, which count vertices rather than sub-geometries."
+    - "Looping over parts in Python with repeated ST_GeometryN queries instead of one ST_Dump or LATERAL generate_series."
+  see_also:
+    - ST_GeometryN
+    - ST_GeometryType
+    - ST_Multi
+    - ST_NPoints
+  tags: [collection, multipart, introspection, count]
+
+- name: ST_GeometryN
+  category: accessors
+  signatures:
+    - "ST_GeometryN(geometry, integer) -> geometry"
+  summary: >-
+    Extracts the nth sub-geometry from a collection, counting from 1. Paired with
+    ST_NumGeometries and generate_series it lets you explode a multipart feature into one
+    row per part entirely in SQL, and on its own it is the idiomatic way to pull the
+    single member out of a MultiPolygon you know has exactly one. Reach for ST_Dump
+    instead whenever you want all the parts, since that is one function call rather than
+    n index lookups.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: The collection to index into. A non-collection is treated as a collection of one.
+    - name: n
+      type: integer
+      description: 1-based position of the desired sub-geometry.
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_GeometryN('MULTIPOINT((0 0),(1 1))'::geometry, 2)) AS second;
+    result: |2-
+         second
+      ------------
+       POINT(1 1)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT ST_AsText(ST_GeometryN(geom, n))
+              FROM routes, generate_series(1, ST_NumGeometries(geom)) AS n
+              WHERE routes.id = %s
+              """,
+              (route_id,),
+          )
+          segments = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsText, ST_GeometryN
+
+      stmt = select(ST_AsText(ST_GeometryN(Route.geom, 1))).where(Route.id == route_id)
+  srid_notes: >-
+    Each extracted part inherits the parent's SRID, so parts can be compared with the
+    original table without any relabelling. Be aware that a part's own bounding box is
+    much tighter than the collection's - that is exactly why exploding multipart rows
+    improves index selectivity, and it is the main reason to do it during a migration
+    rather than at query time.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not indexable. Calling it inside a join condition forces a full scan; materialise
+      the exploded parts into a table with ST_Dump and index that instead.
+  common_mistakes:
+    - "Treating the index as 0-based. The docs state it is 1-based as for OGC specs, unlike Python lists."
+    - "Assuming NULL means the geometry was NULL, when it usually means n exceeded ST_NumGeometries."
+    - "Using it in a generate_series to explode every row of a big table, where ST_Dump does the same work in a single pass."
+  see_also:
+    - ST_NumGeometries
+    - ST_GeometryType
+    - ST_Collect
+    - ST_Multi
+  tags: [collection, multipart, extraction, introspection]
+
+- name: ST_Dimension
+  category: accessors
+  signatures:
+    - "ST_Dimension(geometry) -> integer"
+  summary: >-
+    Returns the topological dimension of a geometry: 0 for points, 1 for lines, 2 for
+    areas, and the maximum of its members for a collection. It is coarser than
+    ST_GeometryType and that is often the point - you usually care whether a row is
+    area-like, not whether it is a Polygon or a MultiPolygon. It is also the value that
+    makes sense of ST_Relate and the DE-9IM strings, where intersections are described by
+    the dimension of the result.
+  returns: integer
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: The geometry to measure. Note this is topological dimension, not coordinate dimension.
+  example:
+    sql: |-
+      SELECT ST_Dimension('LINESTRING(0 0, 1 1)'::geometry) AS d,
+             ST_Dimension('POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))'::geometry) AS p;
+    result: |2-
+       d | p
+      ---+---
+       1 | 2
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT id FROM mixed_features WHERE ST_Dimension(geom) = %s",
+              (2,),
+          )
+          areal_ids = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Dimension
+
+      stmt = select(MixedFeature.id).where(ST_Dimension(MixedFeature.geom) == 2)
+  srid_notes: >-
+    Independent of SRID and unchanged by ST_Transform. Do not confuse it with coordinate
+    dimensionality: a PointZ in any CRS still has ST_Dimension 0, while ST_NDims reports
+    3. That distinction matters when reprojecting, because ST_Transform generally leaves
+    Z untouched - the topological dimension you branch on here says nothing about
+    whether the vertical ordinate survived the trip.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not spatially indexable. On a heterogeneous table a btree expression index on
+      ST_Dimension(geom) can help split areal from linear features, but a typed column
+      per feature class is a better long-term answer.
+  common_mistakes:
+    - "Mistaking it for ST_NDims or ST_CoordDim, which report 2/3/4 for the coordinate ordinates present."
+    - "Expecting 2 for a MultiLineString because it looks two-dimensional on screen; lines are dimension 1 regardless of how they are drawn."
+    - "Assuming a GEOMETRYCOLLECTION reports its first member's dimension - it reports the largest among its members."
+  see_also:
+    - ST_GeometryType
+    - ST_Boundary
+    - ST_Relate
+    - ST_Force2D
+  tags: [dimension, topology, introspection, de9im]

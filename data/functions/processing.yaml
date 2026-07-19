@@ -1,0 +1,1266 @@
+# Geometry processing and construction: the functions that build new geometry out of old.
+# These are the expensive half of PostGIS - they run in GEOS, ignore indexes, and scale with vertex count.
+
+- name: ST_Buffer
+  category: processing
+  signatures:
+    - "ST_Buffer(geometry, radius double precision) -> geometry"
+    - "ST_Buffer(geometry, radius double precision, quad_segs integer) -> geometry"
+    - "ST_Buffer(geometry, radius double precision, options text) -> geometry"
+    - "ST_Buffer(geography, radius double precision) -> geography"
+    - "ST_Buffer(geography, radius double precision, buffer_style_parameters text) -> geography"
+    - "ST_Buffer(geography, radius double precision, num_seg_quarter_circle integer) -> geography"
+  summary: >-
+    Returns a polygon covering every point within the given distance of the input
+    geometry. It is the workhorse for proximity zones - noise contours, riparian
+    setbacks, catchment rings - and also a common trick for cleaning geometry, since
+    buffering by zero forces GEOS to rebuild a polygon's topology. The output is an
+    approximation: curves are drawn as line segments, controlled by quad_segs, so a
+    buffered point is a many-sided polygon rather than a true circle. Reach for it when
+    you need the zone itself as a stored geometry; if you only need "is anything within
+    X", ST_DWithin is enormously cheaper.
+  returns: geometry (geography for the geography form)
+  since: "1.0 (geography since 1.5)"
+  arguments:
+    - name: g
+      type: geometry
+      description: Input geometry of any type; points, lines and polygons all buffer.
+    - name: radius
+      type: double precision
+      description: Distance to buffer outwards. Negative values shrink a polygon inwards.
+    - name: quad_segs
+      type: integer
+      description: Segments used per quarter circle, default 8. Lower it for cheaper, coarser output.
+      optional: true
+    - name: options
+      type: text
+      description: >-
+        Style string such as 'endcap=flat join=mitre side=left', used instead of
+        quad_segs for one-sided and squared-off buffers.
+      optional: true
+  example:
+    sql: |-
+      SELECT ROUND(ST_Area(ST_Buffer('POINT(0 0)'::geometry, 10))::numeric, 1) AS approx_area;
+    result: |2-
+       approx_area
+      -------------
+             312.1
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              INSERT INTO noise_zones (source_id, geom)
+              SELECT id, ST_Buffer(geom::geography, %s)::geometry
+              FROM roads WHERE class = %s
+              """,
+              (150.0, "motorway"),
+          )
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Buffer
+
+      stmt = select(Road.id, ST_Buffer(Road.geom, 25.0, 4).label("zone")).where(
+          Road.class_ == "motorway"
+      )
+  srid_notes: >-
+    On geometry the radius is in SRID units, so ST_Buffer(geom, 100) on SRID 4326 asks
+    for 100 degrees and produces nonsense. Either transform to a projected CRS first or
+    cast to geography, where the radius is metres and PostGIS computes a genuinely
+    geodetic buffer before handing back a geography. The geography path is slower and,
+    for very large radii or polar features, still an approximation - a 1000 km buffer is
+    better done in an appropriate equal-area projection.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Buffering a column produces new geometry, so no index can help and any predicate
+      wrapped around it becomes non-sargable. Filtering with ST_Intersects(other,
+      ST_Buffer(geom, r)) is the classic anti-pattern; ST_DWithin(other, geom, r) is the
+      index-assisted equivalent.
+  common_mistakes:
+    - "Buffering by metres on an SRID 4326 geometry column, which silently buffers by degrees."
+    - "Using ST_Intersects(a, ST_Buffer(b, r)) instead of ST_DWithin(a, b, r) - same answer, no index, orders of magnitude slower."
+    - "Assuming ST_Buffer(g, 0) is a safe repair. It drops rings it cannot resolve; ST_MakeValid is the honest tool."
+  see_also:
+    - ST_DWithin
+    - ST_Expand
+    - ST_MakeValid
+    - ST_Transform
+    - ST_Simplify
+  tags: [buffer, proximity, geos, geography, zones]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: ST_Simplify
+  category: processing
+  signatures:
+    - "ST_Simplify(geometry, tolerance double precision) -> geometry"
+    - "ST_Simplify(geometry, tolerance double precision, preserveCollapsed boolean) -> geometry"
+  summary: >-
+    Applies the Douglas-Peucker algorithm to drop vertices that lie within the tolerance
+    of the simplified line, returning a lighter geometry. It is the standard step before
+    shipping detail-heavy polygons to a browser or into a low-zoom vector tile, where
+    centimetre-accurate coastlines are wasted bytes. The catch is that it is purely
+    geometric and topology-blind: it can self-intersect a polygon, tear a shared border
+    between two neighbouring features, or shrink a small ring below three points, in
+    which case the whole geometry comes back NULL. Use it when speed matters more than
+    validity, and ST_SimplifyPreserveTopology when it does not.
+  returns: geometry (may be NULL if the input collapses)
+  since: "1.2.2"
+  arguments:
+    - name: g
+      type: geometry
+      description: Input geometry. Points and multipoints are returned untouched.
+    - name: tolerance
+      type: double precision
+      description: Maximum distance, in SRID units, a removed vertex may lie from the retained line.
+    - name: preserveCollapsed
+      type: boolean
+      description: >-
+        When true, keeps a degenerate stub rather than returning NULL for geometry that
+        simplifies away entirely. Default false.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_Simplify('LINESTRING(0 0, 1 0.1, 2 0, 3 0.1, 4 0)'::geometry, 0.5)) AS simplified;
+    result: |2-
+          simplified
+      --------------------
+       LINESTRING(0 0,4 0)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_AsGeoJSON(ST_Simplify(geom, %s)) AS geojson
+              FROM coastlines
+              WHERE ST_Simplify(geom, %s) IS NOT NULL
+              """,
+              (0.001, 0.001),
+          )
+          features = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsGeoJSON, ST_Simplify
+
+      stmt = select(Coastline.id, ST_AsGeoJSON(ST_Simplify(Coastline.geom, 0.001)))
+  srid_notes: >-
+    The tolerance is in the units of the geometry's SRID with no conversion whatsoever,
+    so 0.001 means a thousandth of a degree on 4326 (roughly 100 m at the equator, less
+    east-west as you move poleward) and a millimetre on a metric projection. There is no
+    geography overload; cast a geography to geometry and you are simplifying in degrees.
+    For consistent on-screen simplification, transform to the display CRS (often 3857)
+    and pick the tolerance from the zoom level's ground resolution.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Purely computational. If you simplify on every request, store the result in a
+      generated or materialised column and index that instead of paying GEOS on each
+      query.
+  common_mistakes:
+    - "Not handling the NULL return. Small polygons simplify out of existence and quietly vanish from result sets."
+    - "Simplifying adjacent polygons independently, which opens slivers and gaps along borders that used to share vertices."
+    - "Assuming the output is still valid - self-intersections are common at aggressive tolerances, so validate or use the topology-preserving variant."
+  see_also:
+    - ST_SimplifyPreserveTopology
+    - ST_SnapToGrid
+    - ST_RemoveRepeatedPoints
+    - ST_IsValid
+    - ST_AsMVTGeom
+  tags: [simplify, generalisation, douglas-peucker, tiles, vertices]
+
+- name: ST_SimplifyPreserveTopology
+  category: processing
+  signatures:
+    - "ST_SimplifyPreserveTopology(geometry, tolerance double precision) -> geometry"
+  summary: >-
+    Simplifies with the same tolerance semantics as ST_Simplify but constrains the
+    result so that it never self-intersects and never loses a ring, which means it also
+    never returns NULL. GEOS achieves this by backing off the tolerance locally wherever
+    honouring it would break the geometry, so the output is sometimes denser than you
+    asked for. This is the variant to use whenever the simplified geometry will be
+    stored, validated, or fed into further overlay operations. It costs noticeably more
+    CPU than plain ST_Simplify, which is the whole reason both exist.
+  returns: geometry
+  since: "1.3.3"
+  arguments:
+    - name: g
+      type: geometry
+      description: Input geometry. Each ring keeps at least four points and each line at least two.
+    - name: tolerance
+      type: double precision
+      description: Target maximum deviation in SRID units; treated as an upper bound, not a guarantee.
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_Simplify(g, 10)) AS plain,
+             ST_AsText(ST_SimplifyPreserveTopology(g, 10)) AS topo
+      FROM (SELECT 'POLYGON((0 0,10 0,10 10,0 10,0 0))'::geometry AS g) s;
+    result: |2-
+       plain |                 topo
+      -------+---------------------------------------
+             | POLYGON((0 0,10 0,10 10,0 10,0 0))
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              UPDATE admin_boundaries
+              SET geom_generalised = ST_SimplifyPreserveTopology(geom, %s)
+              WHERE level = %s
+              """,
+              (250.0, 2),
+          )
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_SimplifyPreserveTopology
+
+      stmt = select(
+          AdminBoundary.id,
+          ST_SimplifyPreserveTopology(AdminBoundary.geom, 250.0).label("generalised"),
+      )
+  srid_notes: >-
+    Tolerance is in SRID units, identically to ST_Simplify, and there is no geography
+    form. Because the algorithm preserves each feature's own topology only, running it
+    on a projected CRS gives you a tolerance you can reason about in metres; running it
+    on 4326 gives a tolerance whose ground meaning varies with latitude, so a single
+    value over-simplifies the tropics and under-simplifies the Arctic.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      No index involvement. For tile serving, precompute one generalised column per zoom
+      band and build a GiST index on each rather than simplifying at query time.
+  common_mistakes:
+    - "Expecting it to preserve topology *between* features. It only guards each geometry individually, so shared borders still drift apart."
+    - "Reaching for it by default on huge polygon tables when plain ST_Simplify plus a NULL check would be several times faster."
+    - "Assuming the tolerance is always honoured; GEOS reduces it locally to avoid collapse, so vertex counts can stay stubbornly high."
+  see_also:
+    - ST_Simplify
+    - ST_IsValid
+    - ST_MakeValid
+    - ST_AsMVT
+  tags: [simplify, topology, generalisation, geos, tiles]
+
+- name: ST_Union
+  category: processing
+  signatures:
+    - "ST_Union(geometry, geometry) -> geometry"
+    - "ST_Union(geometry, geometry, gridSize double precision) -> geometry"
+    - "ST_Union(geometry[]) -> geometry"
+    - "ST_Union(geometry set) -> geometry"
+    - "ST_Union(geometry set, gridSize double precision) -> geometry"
+  summary: >-
+    Dissolves its inputs into a single geometry with all interior boundaries removed, so
+    overlapping polygons merge and shared edges disappear. Both a two-argument function
+    and an aggregate exist; the aggregate is what you use to dissolve a whole column,
+    typically with GROUP BY to merge parcels into ownership blocks or tiles into a
+    coverage footprint. It is a true topological overlay run in GEOS, which makes it one
+    of the most expensive things in PostGIS - cost grows superlinearly with total vertex
+    count and it happily consumes gigabytes on national datasets. If you only need the
+    parts gathered together rather than genuinely merged, ST_Collect does that in a
+    fraction of the time.
+  returns: geometry
+  since: "1.0 (gridSize variant 3.1)"
+  arguments:
+    - name: g1
+      type: geometry
+      description: First geometry, or the column being aggregated.
+    - name: g2
+      type: geometry
+      description: Second geometry, in the two-argument form only.
+      optional: true
+    - name: gridSize
+      type: double precision
+      description: >-
+        Optional snapping grid for the fixed-precision overlay introduced in 3.1, which
+        avoids many robustness failures on messy data.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_Area(ST_Union(a, b)) AS unioned,
+             ST_Area(ST_Collect(a, b)) AS collected
+      FROM (SELECT 'POLYGON((0 0,2 0,2 2,0 2,0 0))'::geometry AS a,
+                   'POLYGON((1 0,3 0,3 2,1 2,1 0))'::geometry AS b) s;
+    result: |2-
+       unioned | collected
+      ---------+-----------
+             6 |         8
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT owner_id, ST_Union(geom) AS block
+              FROM parcels
+              WHERE municipality = %s
+              GROUP BY owner_id
+              """,
+              (muni_code,),
+          )
+          blocks = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Union
+
+      stmt = (
+          select(Parcel.owner_id, ST_Union(Parcel.geom).label("block"))
+          .where(Parcel.municipality == muni_code)
+          .group_by(Parcel.owner_id)
+      )
+  srid_notes: >-
+    Every input must share one SRID or the call errors; the aggregate will not reproject
+    for you, so transform inside the aggregate (ST_Union(ST_Transform(geom, 3857))) if
+    the table is mixed. There is no geography overload, so a geography column must be
+    cast, and unioning lat/lon polygons that straddle the antimeridian produces a
+    geometry spanning the whole globe. Area and length of the result are in the SRID's
+    units, which is a common source of "my dissolved region is 0.004 square units".
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Aggregates never use a spatial index. Reduce the row set with an indexed WHERE
+      first, and prefer many small GROUP BY unions over one giant one - GEOS memory use
+      is driven by the largest single overlay.
+  common_mistakes:
+    - "Using ST_Union where ST_Collect would do. If nothing overlaps and you only need a multi-geometry, the dissolve work is pure waste."
+    - "Unioning an entire country's parcels in one statement and hitting an out-of-memory or GEOS TopologyException instead of batching by region."
+    - "Assuming the output is valid. Union of invalid inputs frequently throws; run ST_MakeValid first or pass a gridSize."
+  see_also:
+    - ST_Collect
+    - ST_Intersection
+    - ST_Difference
+    - ST_Subdivide
+    - ST_MakeValid
+  tags: [union, dissolve, aggregate, overlay, geos]
+
+- name: ST_Collect
+  category: processing
+  signatures:
+    - "ST_Collect(geometry, geometry) -> geometry"
+    - "ST_Collect(geometry[]) -> geometry"
+    - "ST_Collect(geometry set) -> geometry"
+  summary: >-
+    Gathers its inputs into a single multi-geometry or geometry collection without doing
+    any geometric work at all: nothing is merged, no boundaries dissolve, and overlaps
+    stay overlapping. Because it is essentially a memcpy into one container, it is
+    dramatically cheaper than ST_Union and is the right choice whenever you want to move
+    many rows through one function call, build a MULTIPOINT for a hull, or hand a single
+    geometry to a client. If every input is the same type you get a MULTIPOINT,
+    MULTILINESTRING or MULTIPOLYGON; mix the types and you get a GEOMETRYCOLLECTION,
+    which many downstream functions refuse to accept.
+  returns: geometry (multi-geometry or geometry collection)
+  since: "1.0"
+  arguments:
+    - name: g1
+      type: geometry
+      description: First geometry, or the column being aggregated.
+    - name: g2
+      type: geometry
+      description: Second geometry, in the two-argument form only.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_GeometryType(g) AS geomtype, ST_NumGeometries(g) AS parts
+      FROM (SELECT ST_Collect('POINT(0 0)'::geometry, 'POINT(1 1)'::geometry) AS g) s;
+    result: |2-
+         geomtype    | parts
+      ---------------+-------
+       ST_MultiPoint |     2
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT route_id, ST_AsGeoJSON(ST_Collect(geom)) AS stops
+              FROM bus_stops
+              WHERE agency = %s
+              GROUP BY route_id
+              """,
+              (agency,),
+          )
+          route_stops = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Collect
+
+      stmt = (
+          select(BusStop.route_id, ST_Collect(BusStop.geom).label("stops"))
+          .group_by(BusStop.route_id)
+      )
+  srid_notes: >-
+    All inputs must share an SRID and the collection inherits it; no reprojection or
+    validation happens on the way in. Since nothing is computed, no distance or area
+    unit question arises at collect time - but the resulting multipolygon can be
+    invalid (overlapping parts), and any later ST_Area on it simply sums the parts and
+    double-counts the overlap.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      No index use, but the cost is close to free, so collecting a filtered set and then
+      running one overlay against the collection is often faster than one overlay per
+      row.
+  common_mistakes:
+    - "Expecting overlaps to merge. ST_Collect boxes geometries together; only ST_Union dissolves them."
+    - "Collecting mixed types and then feeding the GEOMETRYCOLLECTION to a function or client that only handles simple types."
+    - "Storing the result in a column typed MULTIPOLYGON when a stray point in the input turns it into a collection and the insert fails."
+  see_also:
+    - ST_Union
+    - ST_ConvexHull
+    - ST_NumGeometries
+    - ST_GeometryN
+    - ST_Multi
+  tags: [collect, aggregate, multi-geometry, cheap, grouping]
+
+- name: ST_Intersection
+  category: processing
+  signatures:
+    - "ST_Intersection(geometry, geometry) -> geometry"
+    - "ST_Intersection(geometry, geometry, gridSize double precision) -> geometry"
+    - "ST_Intersection(geography, geography) -> geography"
+  summary: >-
+    Returns the shared portion of two geometries as new geometry - the clipped overlap,
+    not a boolean. It is what you use to cut features to a study area, apportion
+    population by intersecting census blocks with a catchment, or clip lines to a tile.
+    The result's dimension can be lower than the inputs (two polygons touching along an
+    edge intersect in a line) and can be an empty geometry when nothing overlaps, so
+    downstream code must cope with both. Always pair it with an indexed ST_Intersects in
+    the WHERE clause: the predicate finds the candidate pairs cheaply, and only then do
+    you pay GEOS to compute the geometry.
+  returns: geometry (possibly empty, possibly of lower dimension)
+  since: "1.0 (gridSize variant 3.1)"
+  arguments:
+    - name: g1
+      type: geometry
+      description: First input geometry.
+    - name: g2
+      type: geometry
+      description: Second input geometry, commonly the clip boundary.
+    - name: gridSize
+      type: double precision
+      description: Fixed-precision grid size for the overlay, added in 3.1 to sidestep robustness errors.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_Area(ST_Intersection('POLYGON((0 0,2 0,2 2,0 2,0 0))'::geometry,
+                                     'POLYGON((1 0,3 0,3 2,1 2,1 0))'::geometry)) AS overlap;
+    result: |2-
+       overlap
+      ---------
+             2
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT b.block_id,
+                     ST_Area(ST_Intersection(b.geom, c.geom)) / ST_Area(b.geom) AS share
+              FROM census_blocks b
+              JOIN catchments c ON ST_Intersects(b.geom, c.geom)
+              WHERE c.id = %s
+              """,
+              (catchment_id,),
+          )
+          shares = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Intersection, ST_Intersects
+
+      stmt = (
+          select(CensusBlock.block_id, ST_Intersection(CensusBlock.geom, Catchment.geom))
+          .join(Catchment, ST_Intersects(CensusBlock.geom, Catchment.geom))
+          .where(Catchment.id == catchment_id)
+      )
+  srid_notes: >-
+    Mixed SRIDs raise an error rather than reprojecting. The geography overload exists
+    but internally works by transforming to a suitable planar CRS, so for anything but
+    small extents you get better control by transforming explicitly to an equal-area
+    projection - especially if you are about to divide the intersected area by the total
+    area, where a degree-based ST_Area gives ratios that are subtly wrong away from the
+    equator.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      The function itself is unindexable, so the join must be driven by ST_Intersects
+      (or &&) on indexed columns. Without that predicate the planner produces a nested
+      loop that clips every pair in the cross product.
+  common_mistakes:
+    - "Joining on ST_Area(ST_Intersection(a, b)) > 0 instead of ST_Intersects(a, b), which discards the index and computes every pair."
+    - "Assuming the result is a polygon. Edge-touching polygons intersect in a LINESTRING and area-based logic then returns 0."
+    - "Running it on invalid input and hitting a GEOS TopologyException; ST_MakeValid or a gridSize argument fixes most of these."
+  see_also:
+    - ST_Intersects
+    - ST_Difference
+    - ST_Union
+    - ST_IsEmpty
+    - ST_MakeValid
+  tags: [intersection, overlay, clip, geos, spatial-join]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: ST_Difference
+  category: processing
+  signatures:
+    - "ST_Difference(geometry, geometry) -> geometry"
+    - "ST_Difference(geometry, geometry, gridSize double precision) -> geometry"
+  summary: >-
+    Returns the part of the first geometry that does not lie inside the second - an
+    erase or cookie-cutter operation. Typical uses are punching protected areas out of a
+    development envelope, subtracting last year's footprint from this year's to get the
+    change polygon, or removing water bodies from a land-cover layer. It is strictly
+    ordered: ST_Difference(a, b) and ST_Difference(b, a) are different answers, which is
+    the single most common source of confusion. Like the other overlays it is a GEOS
+    operation with no index support and a real appetite for vertices.
+  returns: geometry (empty when the first geometry lies wholly inside the second)
+  since: "1.0 (gridSize variant 3.1)"
+  arguments:
+    - name: g1
+      type: geometry
+      description: The geometry to keep and cut from.
+    - name: g2
+      type: geometry
+      description: The geometry to subtract.
+    - name: gridSize
+      type: double precision
+      description: Fixed-precision grid size for the overlay, added in 3.1.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_Area(ST_Difference('POLYGON((0 0,2 0,2 2,0 2,0 0))'::geometry,
+                                   'POLYGON((1 0,3 0,3 2,1 2,1 0))'::geometry)) AS remaining;
+    result: |2-
+       remaining
+      -----------
+               2
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT p.id, ST_Difference(p.geom, ST_Union(w.geom)) AS dry_land
+              FROM parcels p
+              JOIN water_bodies w ON ST_Intersects(p.geom, w.geom)
+              WHERE p.id = ANY(%s)
+              GROUP BY p.id, p.geom
+              """,
+              (parcel_ids,),
+          )
+          dry = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Difference
+
+      stmt = select(
+          Parcel.id, ST_Difference(Parcel.geom, WaterBody.geom).label("dry_land")
+      ).where(Parcel.id == parcel_id)
+  srid_notes: >-
+    Both arguments must share an SRID; there is no geography overload, so a geography
+    column has to be cast to geometry and the subtraction then happens planar in whatever
+    CRS that is. Erasing in 4326 near the poles distorts the shape of the cut, so if the
+    resulting area feeds a calculation, transform both sides to an equal-area projection
+    before differencing rather than after.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      Unindexable in itself. Drive the join with ST_Intersects on indexed columns so
+      that only genuinely overlapping pairs reach GEOS - subtracting a non-overlapping
+      geometry just returns the original at full computational cost.
+  common_mistakes:
+    - "Swapping the arguments. The call succeeds and returns a perfectly valid wrong answer."
+    - "Subtracting overlapping erase features one row at a time in a loop instead of subtracting a single ST_Union of them."
+    - "Not checking ST_IsEmpty on the result when the first geometry is completely covered by the second."
+  see_also:
+    - ST_Intersection
+    - ST_Union
+    - ST_IsEmpty
+    - ST_Covers
+    - ST_MakeValid
+  tags: [difference, erase, overlay, geos, clip]
+
+- name: ST_Subdivide
+  category: processing
+  signatures:
+    - "ST_Subdivide(geometry, max_vertices integer = 256) -> setof geometry"
+    - "ST_Subdivide(geometry, max_vertices integer, gridSize double precision) -> setof geometry"
+  summary: >-
+    A set-returning function that recursively splits a geometry until every piece has at
+    most max_vertices vertices, together tiling the original exactly. Its real purpose is
+    index selectivity: one continent-sized multipolygon has a bounding box covering half
+    the planet, so a GiST index on it matches almost every query and the expensive exact
+    recheck then runs on a hundred thousand vertices. Subdividing that row into hundreds
+    of small pieces gives tight boxes, and the resulting spatial joins commonly run one
+    or two orders of magnitude faster. Store the pieces in a side table keyed back to the
+    original, index them, and join on that.
+  returns: setof geometry
+  since: "2.2 (gridSize since 3.1)"
+  arguments:
+    - name: g
+      type: geometry
+      description: Geometry to split. Points and small geometries come back as a single row.
+    - name: max_vertices
+      type: integer
+      description: Vertex ceiling per output piece, default 256, minimum 5.
+      optional: true
+    - name: gridSize
+      type: double precision
+      description: Fixed-precision grid size for the internal clipping, added in 3.1.
+      optional: true
+  example:
+    sql: |-
+      SELECT ROUND(SUM(ST_Area(g))::numeric, 1) AS total_area
+      FROM ST_Subdivide('POLYGON((0 0,10 0,10 10,0 10,0 0))'::geometry, 5) AS g;
+    result: |2-
+       total_area
+      ------------
+            100.0
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              INSERT INTO country_parts (country_id, geom)
+              SELECT id, ST_Subdivide(geom, %s) FROM countries
+              """,
+              (128,),
+          )
+          cur.execute("CREATE INDEX ON country_parts USING gist (geom)")
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Subdivide
+
+      stmt = select(Country.id, ST_Subdivide(Country.geom, 128).label("part"))
+  srid_notes: >-
+    Pieces inherit the input SRID and max_vertices has no unit, so the function is CRS
+    agnostic - but the point of it is bounding boxes, and those are only useful if the
+    subdivided table shares the SRID of whatever you join it against. Subdividing a 4326
+    geometry that crosses the antimeridian does not fix the wrapped box problem; split
+    on the dateline first, then subdivide.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      The function is unindexed, but it exists to make other queries indexable. After
+      subdividing into a side table and building a GiST index there, joins get selective
+      boxes and cheap rechecks; remember to de-duplicate results with DISTINCT since one
+      original row now matches through several pieces.
+  common_mistakes:
+    - "Setting max_vertices very low, which explodes the row count and makes the extra join cost outweigh the index gain - 128 to 512 is the usual sweet spot."
+    - "Forgetting DISTINCT on the parent id when joining, so a feature matching three pieces appears three times."
+    - "Subdividing without then building a GiST index on the pieces, which throws away the entire benefit."
+  see_also:
+    - ST_Union
+    - ST_Intersects
+    - ST_Envelope
+    - ST_MemSize
+    - ST_MakeValid
+  tags: [subdivide, index-selectivity, performance, large-polygons, gist]
+  docs_url: https://www.postgis-python.com/advanced-gist-indexing-optimization/
+
+- name: ST_ConvexHull
+  category: processing
+  signatures:
+    - "ST_ConvexHull(geometry) -> geometry"
+  summary: >-
+    Returns the smallest convex polygon enclosing every point of the input - the shape a
+    rubber band would take if stretched around the geometry. It is a fast, robust way to
+    get a coverage footprint from a scattered point cloud, to summarise a
+    multi-geometry's extent more tightly than a bounding box, or to build a cheap
+    prefilter shape for a complex feature. Because it is convex it always overshoots
+    concave arrangements, sometimes wildly: a crescent of survey points hulls into a
+    solid blob. It is normally used with ST_Collect to hull a whole group of rows at
+    once.
+  returns: geometry (a polygon, or a line/point for degenerate input)
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: Any geometry; collections and multi-geometries are hulled as one point set.
+  example:
+    sql: |-
+      SELECT ST_Area(ST_ConvexHull('MULTIPOINT(0 0, 10 0, 10 10, 0 10, 5 5)'::geometry)) AS hull_area;
+    result: |2-
+       hull_area
+      -----------
+             100
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT survey_id, ST_AsGeoJSON(ST_ConvexHull(ST_Collect(geom))) AS footprint
+              FROM samples
+              GROUP BY survey_id
+              """
+          )
+          footprints = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Collect, ST_ConvexHull
+
+      stmt = (
+          select(Sample.survey_id, ST_ConvexHull(ST_Collect(Sample.geom)).label("footprint"))
+          .group_by(Sample.survey_id)
+      )
+  srid_notes: >-
+    The hull is computed planar in the input SRID and inherits it. On 4326 the hull edges
+    are straight in degree space, not great circles, so a hull spanning many degrees of
+    longitude bulges the wrong way relative to the true geodesic shape, and one crossing
+    the antimeridian wraps around the globe. Transform to a projected CRS before hulling
+    continental-scale point sets.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not indexable, but cheap and deterministic, so hulls are commonly precomputed and
+      stored as an indexed summary column for complex features.
+  common_mistakes:
+    - "Hulling row by row instead of ST_ConvexHull(ST_Collect(geom)) with a GROUP BY, which returns one degenerate hull per point."
+    - "Expecting it to follow concave outlines - that is ST_ConcaveHull's job."
+    - "Assuming a polygon comes back. Two collinear points hull to a LINESTRING and one point hulls to a POINT."
+  see_also:
+    - ST_ConcaveHull
+    - ST_Collect
+    - ST_Envelope
+    - ST_Buffer
+  tags: [convex-hull, footprint, extent, geos, aggregation]
+
+- name: ST_ConcaveHull
+  category: processing
+  signatures:
+    - "ST_ConcaveHull(geometry, param_pctconvex double precision) -> geometry"
+    - "ST_ConcaveHull(geometry, param_pctconvex double precision, param_allow_holes boolean) -> geometry"
+  summary: >-
+    Produces a hull that can follow concavities in the input, giving a much tighter
+    outline than a convex hull for elongated, curved or clustered point sets. The
+    pctconvex parameter interpolates between the two behaviours: 1 returns exactly the
+    convex hull, and values approaching 0 hug the points ever more closely at the cost of
+    a stringier, spikier boundary. It is the usual way to derive a plausible service area
+    from delivery points or a lake outline from soundings, but the "right" parameter is
+    empirical - expect to try several. PostGIS 3.3 replaced the old implementation with a
+    much faster and more predictable GEOS one.
+  returns: geometry (a polygon; a two-point LineString for collinear input, a Point for identical points)
+  since: "2.0 (GEOS native implementation enabled in 3.3 for GEOS 3.11+)"
+  arguments:
+    - name: g
+      type: geometry
+      description: Input geometry, typically a MULTIPOINT built with ST_Collect.
+    - name: param_pctconvex
+      type: double precision
+      description: >-
+        Target convexity from 0 to 1. 1 is the convex hull; lower values allow deeper
+        concavities.
+    - name: param_allow_holes
+      type: boolean
+      description: When true, permits holes in the result. Default false.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_Area(ST_ConcaveHull('MULTIPOINT(0 0, 10 0, 10 10, 0 10, 5 5)'::geometry, 1)) AS hull_area;
+    result: |2-
+       hull_area
+      -----------
+             100
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT depot_id, ST_ConcaveHull(ST_Collect(geom), %s) AS service_area
+              FROM deliveries
+              GROUP BY depot_id
+              """,
+              (0.8,),
+          )
+          areas = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Collect, ST_ConcaveHull
+
+      stmt = (
+          select(Delivery.depot_id, ST_ConcaveHull(ST_Collect(Delivery.geom), 0.8))
+          .group_by(Delivery.depot_id)
+      )
+  srid_notes: >-
+    Planar in the input SRID, with no geography form. Because the algorithm reasons about
+    edge lengths, running it on 4326 means those lengths are in degrees and are
+    anisotropic away from the equator - the hull then prefers to cut in the east-west
+    direction. Project to a local metric CRS before hulling if the shape matters.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not indexable and materially more expensive than ST_ConvexHull, particularly on
+      pre-3.3 installs. Precompute and store hulls rather than deriving them per request.
+  common_mistakes:
+    - "Treating pctconvex as a distance. It is a dimensionless target convexity, not a tolerance in map units."
+    - "Pushing it toward 0 and getting a self-touching, spidery polygon that later overlay operations reject."
+    - "Assuming the result always has area. Collinear input yields a two-point LineString and identical points yield a Point."
+  see_also:
+    - ST_ConvexHull
+    - ST_Collect
+    - ST_ClusterDBSCAN
+    - ST_MakeValid
+  tags: [concave-hull, footprint, point-cloud, geos, outline]
+
+- name: ST_Centroid
+  category: processing
+  signatures:
+    - "ST_Centroid(geometry) -> geometry"
+    - "ST_Centroid(geography, use_spheroid boolean = true) -> geography"
+  summary: >-
+    Returns the geometric centre of mass of the input: the area-weighted centre for
+    polygons, the length-weighted centre for lines, and the plain average for points.
+    It is the standard way to reduce a polygon layer to point markers for small-scale
+    display, to give each feature a stable label anchor, or to attach a single
+    coordinate to an area for downstream distance work. The crucial caveat is that the
+    centroid is not required to lie inside the geometry - for C shapes, crescents, rings
+    with big holes and multipolygons of scattered islands it very often falls outside.
+    Use ST_PointOnSurface whenever the point must be on the feature.
+  returns: geometry (a POINT), or geography for the geography form
+  since: "1.0 (geography since 2.4)"
+  arguments:
+    - name: g
+      type: geometry
+      description: Any geometry. If an empty geometry is supplied, an empty GEOMETRYCOLLECTION is returned.
+    - name: use_spheroid
+      type: boolean
+      description: >-
+        Geography form only; when false the cheaper sphere model is used instead of the
+        spheroid. Default true.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_Centroid('POLYGON((0 0,10 0,10 10,0 10,0 0))'::geometry)) AS c;
+    result: |2-
+           c
+      ------------
+       POINT(5 5)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_X(ST_Centroid(geom)) AS lon, ST_Y(ST_Centroid(geom)) AS lat
+              FROM districts
+              WHERE region = %s
+              """,
+              (region,),
+          )
+          markers = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Centroid, ST_X, ST_Y
+
+      c = ST_Centroid(District.geom)
+      stmt = select(District.id, ST_X(c).label("lon"), ST_Y(c).label("lat"))
+
+  srid_notes: >-
+    The geometry form computes the centroid planar in the input SRID and returns a point
+    with that SRID. On 4326 this is an average of degrees, which drifts from the true
+    surface centroid for large or high-latitude features; the geography form does the
+    calculation on the spheroid and is the correct choice there. Averaging degrees across
+    the antimeridian puts the centroid on the far side of the world.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Wrapping an indexed column in ST_Centroid inside a predicate makes it non-sargable.
+      If you query by centroid regularly, store it as a generated column and put its own
+      GiST index on it.
+  common_mistakes:
+    - "Assuming the centroid is inside the polygon. For C shapes, rings and island groups it usually is not."
+    - "Using it as a label point for multipolygons, where the centroid lands in the sea between the islands."
+    - "Computing ST_Centroid on a 4326 column and then measuring distances from it in degrees."
+  see_also:
+    - ST_PointOnSurface
+    - ST_X
+    - ST_Y
+    - ST_Envelope
+    - ST_Area
+  tags: [centroid, centre-of-mass, label-point, reduction, points]
+
+- name: ST_PointOnSurface
+  category: processing
+  signatures:
+    - "ST_PointOnSurface(geometry) -> geometry"
+  summary: >-
+    Returns a point that is guaranteed to lie on the input geometry - inside the polygon
+    for surfaces, on the line for curves, and the geometry itself for points. It exists
+    precisely because ST_Centroid offers no such guarantee, so this is the function to
+    use for map labels, tooltip anchors, marker clustering and any join where the
+    representative point must resolve back to its own feature. The trade-off is that the
+    point is not "central" in any meaningful sense: it is whatever GEOS finds convenient,
+    so it can sit close to an edge and can shift substantially if the geometry is edited.
+  returns: geometry (a POINT with the input SRID)
+  since: "1.0"
+  arguments:
+    - name: g
+      type: geometry
+      description: Any geometry. For multipolygons the point lies inside one of the parts.
+  example:
+    sql: |-
+      SELECT ST_Contains(g, ST_Centroid(g)) AS centroid_inside,
+             ST_Contains(g, ST_PointOnSurface(g)) AS surface_inside
+      FROM (SELECT 'POLYGON((0 0, 10 0, 10 2, 2 2, 2 8, 10 8, 10 10, 0 10, 0 0))'::geometry AS g) s;
+    result: |2-
+       centroid_inside | surface_inside
+      -----------------+----------------
+       f               | t
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, name, ST_AsGeoJSON(ST_PointOnSurface(geom)) AS label_point
+              FROM lakes
+              WHERE area_ha > %s
+              """,
+              (50,),
+          )
+          labels = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsGeoJSON, ST_PointOnSurface
+
+      stmt = select(Lake.id, ST_AsGeoJSON(ST_PointOnSurface(Lake.geom)).label("label_point"))
+  srid_notes: >-
+    The computation is planar in the input SRID and the result carries that SRID, with no
+    geography overload - cast a geography and you are working in degrees. Unlike a
+    centroid the "on the surface" guarantee survives reprojection in practice, but the
+    chosen point moves when you transform, so do not treat it as a stable identifier
+    across CRS changes.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Non-sargable when wrapped around an indexed column. Materialise it as a label-point
+      column with its own GiST index if labels are queried spatially.
+  common_mistakes:
+    - "Expecting a visually centred point. It is only guaranteed to be inside, and is often near an edge."
+    - "Using it where ST_Centroid's mass-weighted semantics were actually wanted, for example in statistical summaries."
+    - "Assuming it is stable across edits or reprojections and storing it as a join key."
+  see_also:
+    - ST_Centroid
+    - ST_Contains
+    - ST_Within
+    - ST_X
+  tags: [label-point, representative-point, inside, polygons, cartography]
+
+- name: ST_ClosestPoint
+  category: processing
+  signatures:
+    - "ST_ClosestPoint(geometry, geometry) -> geometry"
+    - "ST_ClosestPoint(geography, geography, use_spheroid boolean = true) -> geography"
+  summary: >-
+    Returns the point on the first geometry that lies nearest to the second. The
+    classic use is snapping: given a GPS fix and a road network, ST_ClosestPoint of the
+    matched road gives the position on the centreline, which is what you store for
+    map-matching, linear referencing or a "nearest access point" answer. It is
+    asymmetric, so swapping the arguments gives a point on the other geometry instead.
+    Combine it with a KNN ORDER BY to find the candidate feature first, then compute the
+    snapped point on just that one row.
+  returns: geometry (a POINT)
+  since: "1.5 (geography since 3.4)"
+  arguments:
+    - name: g1
+      type: geometry
+      description: The geometry the returned point will lie on.
+    - name: g2
+      type: geometry
+      description: The reference geometry to be nearest to.
+    - name: use_spheroid
+      type: boolean
+      description: Geography form only; false selects the faster sphere model. Default true.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_ClosestPoint('LINESTRING(0 0, 10 0)'::geometry,
+                                       'POINT(5 5)'::geometry)) AS snapped;
+    result: |2-
+        snapped
+      ------------
+       POINT(5 0)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT r.id, ST_AsText(ST_ClosestPoint(r.geom, p.geom)) AS snapped
+              FROM roads r, (SELECT ST_SetSRID(ST_MakePoint(%s, %s), 27700) AS geom) p
+              ORDER BY r.geom <-> p.geom
+              LIMIT 1
+              """,
+              (easting, northing),
+          )
+          road_id, snapped = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_ClosestPoint
+
+      stmt = (
+          select(Road.id, ST_ClosestPoint(Road.geom, fix_point).label("snapped"))
+          .order_by(Road.geom.distance_centroid(fix_point))
+          .limit(1)
+      )
+  srid_notes: >-
+    Both arguments must share an SRID and the result inherits it. The geometry form finds
+    the planar nearest point, so on 4326 "nearest" is measured in degrees and is skewed
+    east-west away from the equator - a snapped point on a long east-west road can be
+    visibly off. Snap in a projected CRS, or use the geography form, then transform back.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      The function itself never uses an index. Select the target row with an
+      index-assisted <-> ORDER BY ... LIMIT or an ST_DWithin filter, and only then call
+      ST_ClosestPoint on the survivor.
+  common_mistakes:
+    - "Reversing the arguments and getting a point on the wrong geometry - it always lies on the first one."
+    - "Calling it across a whole roads table instead of narrowing to the nearest candidate with <-> first."
+    - "Snapping in 4326 and being surprised the point is not perpendicular on screen."
+  see_also:
+    - ST_ShortestLine
+    - ST_Distance
+    - "<->"
+    - ST_LineLocatePoint
+    - ST_LineInterpolatePoint
+  tags: [snapping, nearest-point, map-matching, linear-referencing, geos]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: ST_ShortestLine
+  category: processing
+  signatures:
+    - "ST_ShortestLine(geometry, geometry) -> geometry"
+    - "ST_ShortestLine(geography, geography, use_spheroid boolean = true) -> geography"
+  summary: >-
+    Returns the two-point line segment joining the closest points of the two inputs; its
+    length is exactly ST_Distance. It is mostly a visualisation and QA tool - draw the
+    connector to show a user which building the pipeline was measured to, or to eyeball
+    why a distance came out larger than expected. It also gives you both endpoints in one
+    call, which saves running ST_ClosestPoint twice with the arguments swapped. When the
+    geometries intersect, the result degenerates to a zero-length line at the
+    intersection point.
+  returns: geometry (a two-point LINESTRING)
+  since: "1.5 (geography since 3.4)"
+  arguments:
+    - name: g1
+      type: geometry
+      description: First geometry; the line starts on this one.
+    - name: g2
+      type: geometry
+      description: Second geometry; the line ends on this one.
+    - name: use_spheroid
+      type: boolean
+      description: Geography form only; false selects the sphere model. Default true.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_ShortestLine('LINESTRING(0 0, 10 0)'::geometry,
+                                       'POINT(5 5)'::geometry)) AS connector;
+    result: |2-
+           connector
+      ---------------------
+       LINESTRING(5 0,5 5)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT h.id, ST_AsGeoJSON(ST_ShortestLine(h.geom, m.geom)) AS connector
+              FROM hydrants h
+              JOIN mains m ON ST_DWithin(h.geom, m.geom, %s)
+              """,
+              (100.0,),
+          )
+          connectors = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_DWithin, ST_ShortestLine
+
+      stmt = select(
+          Hydrant.id, ST_ShortestLine(Hydrant.geom, Main.geom).label("connector")
+      ).join(Main, ST_DWithin(Hydrant.geom, Main.geom, 100.0))
+
+  srid_notes: >-
+    Shared SRID required, inherited by the result. The geometry form draws a straight
+    line in the input CRS, so on 4326 it is a rhumb-like segment in degree space, not a
+    great circle, and its ST_Length is in degrees. The geography form returns a geodesic
+    connector whose length is metres - which is also what makes the two forms disagree
+    about which pair of features is actually closest over long distances.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      Not indexable. Restrict the pairs first with ST_DWithin or a KNN ORDER BY on
+      indexed columns, otherwise you compute a connector for the entire cross product.
+  common_mistakes:
+    - "Measuring with ST_Length(ST_ShortestLine(a, b)) instead of just ST_Distance(a, b), which is the same number for less work."
+    - "Not handling the zero-length result when the inputs intersect, which breaks code that assumes two distinct endpoints."
+    - "Drawing 4326 connectors on a globe view and expecting them to follow the great-circle path."
+  see_also:
+    - ST_ClosestPoint
+    - ST_Distance
+    - ST_DWithin
+    - "<->"
+  tags: [shortest-line, connector, distance, visualisation, qa]
+
+- name: ST_Segmentize
+  category: processing
+  signatures:
+    - "ST_Segmentize(geometry, max_segment_length double precision) -> geometry"
+    - "ST_Segmentize(geography, max_segment_length double precision) -> geography"
+  summary: >-
+    Adds vertices along a geometry so that no segment is longer than the given length,
+    without moving any existing vertex or changing the shape. It matters most before
+    reprojection: a straight 500 km line in 4326 becomes a straight line in the target
+    CRS too, when the correct projected path is curved, and densifying first makes the
+    reprojected geometry follow the right route. The geography form is the standard way
+    to turn a two-point flight path into a drawable great-circle arc. It only ever adds
+    vertices, so use it deliberately - it is the exact inverse of everything ST_Simplify
+    is for.
+  returns: geometry (geography for the geography form), densified
+  since: "1.2.2 (geography since 2.1)"
+  arguments:
+    - name: g
+      type: geometry
+      description: Line or polygon geometry to densify. Points are returned unchanged.
+    - name: max_segment_length
+      type: double precision
+      description: >-
+        Maximum allowed segment length - SRID units for geometry, metres for geography.
+        Segments are split into equal parts, so pieces are usually shorter than this.
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_Segmentize('LINESTRING(0 0, 4 0)'::geometry, 1)) AS densified;
+    result: |2-
+                 densified
+      -------------------------------
+       LINESTRING(0 0,1 0,2 0,3 0,4 0)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_AsGeoJSON(ST_Transform(ST_Segmentize(geom::geography, %s)::geometry, 3857))
+              FROM flight_paths
+              WHERE id = %s
+              """,
+              (50000.0, path_id),
+          )
+          arc = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Segmentize, ST_Transform
+
+      stmt = select(
+          FlightPath.id,
+          ST_Transform(ST_Segmentize(FlightPath.geom, 0.5), 3857).label("arc"),
+      )
+  srid_notes: >-
+    This is the one processing function where choosing geometry or geography changes the
+    shape, not just the units. On geometry the length is in SRID units and the added
+    vertices sit on the straight planar chord; on geography the length is metres and the
+    vertices follow the geodesic, which is why segmentizing as geography before
+    transforming is the recipe for correct long-distance lines. Segmentize before
+    ST_Transform, never after.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      No index involvement, but it inflates vertex counts and therefore the cost of every
+      later overlay, index page size and TOAST traffic. Densify at the last possible step,
+      ideally in the rendering query rather than in storage.
+  common_mistakes:
+    - "Passing metres to the geometry form on a 4326 column, where the value is degrees and nothing is added."
+    - "Segmentizing after ST_Transform, which densifies the already-wrong straight line."
+    - "Densifying stored geometry table-wide and then wondering why overlays and index scans got slower."
+  see_also:
+    - ST_Transform
+    - ST_Simplify
+    - ST_LineInterpolatePoint
+    - ST_Length
+    - ST_NPoints
+  tags: [segmentize, densify, reprojection, geodesic, lines]
+
+- name: ST_Expand
+  category: processing
+  signatures:
+    - "ST_Expand(geometry, units_to_expand double precision) -> geometry"
+    - "ST_Expand(geometry, dx double precision, dy double precision, dz double precision = 0, dm double precision = 0) -> geometry"
+    - "ST_Expand(box2d, units_to_expand double precision) -> box2d"
+    - "ST_Expand(box2d, dx double precision, dy double precision) -> box2d"
+    - "ST_Expand(box3d, units_to_expand double precision) -> box3d"
+    - "ST_Expand(box3d, dx double precision, dy double precision, dz double precision = 0) -> box3d"
+  summary: >-
+    Returns the input's bounding box grown by the given amount in every direction, as a
+    rectangle. Think of it as a bounding-box buffer: enormously cheaper than ST_Buffer
+    because it touches four numbers rather than every vertex, and always a rectangle
+    rather than an approximated curve. Its main job is building the search window for a
+    two-stage proximity query - expand the box, use && against a GiST index to get
+    candidates, then apply the exact test. It is also how you grow a viewport envelope to
+    include features whose labels or symbols spill over the edge.
+  returns: geometry (a rectangular polygon), or box2d for the box2d form
+  since: "1.0 (dx/dy form since 2.3)"
+  arguments:
+    - name: g
+      type: geometry
+      description: Geometry whose bounding box is expanded; the geometry itself is not used further.
+    - name: units_to_expand
+      type: double precision
+      description: Distance in SRID units added to all four sides. Negative values shrink the box.
+    - name: dy
+      type: double precision
+      description: Separate vertical expansion in the two-distance form; the second argument is then dx.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_Expand('POINT(5 5)'::geometry, 1)) AS window;
+    result: |2-
+                     window
+      ------------------------------------
+       POLYGON((4 4,4 6,6 6,6 4,4 4))
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id FROM poi
+              WHERE geom && ST_Expand(ST_SetSRID(ST_MakePoint(%s, %s), 3857), %s)
+              """,
+              (x, y, 500.0),
+          )
+          candidates = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Expand, ST_MakePoint, ST_SetSRID
+
+      here = ST_SetSRID(ST_MakePoint(x, y), 3857)
+      stmt = select(Poi.id).where(Poi.geom.bool_op("&&")(ST_Expand(here, 500.0)))
+  srid_notes: >-
+    The expansion is in SRID units and the result keeps the input SRID; there is no
+    geography form, so expanding a lat/lon point by 500 grows the box by 500 degrees. On
+    4326 a fixed degree expansion is a shrinking ground distance as latitude rises, so a
+    box built for a 1 km radius at the equator is far too small in Scandinavia - divide
+    by cos(latitude) or, better, work in a projected CRS. Boxes that cross the
+    antimeridian or the poles are clamped and wrap unhelpfully.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      The function itself is not indexed, but it is normally the constant side of an
+      indexed && or ST_Intersects test, which makes the surrounding query fully
+      index-assisted. Keep it off the indexed column and on the parameter.
+  common_mistakes:
+    - "Expanding the indexed column instead of the search geometry, which turns a sargable predicate into a sequential scan."
+    - "Using it as a substitute for ST_DWithin and getting the corners of the square as false positives without an exact recheck."
+    - "Expanding by metres on a 4326 column, or forgetting the latitude correction when converting metres to degrees."
+  see_also:
+    - "&&"
+    - ST_DWithin
+    - ST_Envelope
+    - ST_MakeEnvelope
+    - ST_Buffer
+  tags: [bbox, expand, prefilter, search-window, index]
+  docs_url: https://www.postgis-python.com/advanced-gist-indexing-optimization/

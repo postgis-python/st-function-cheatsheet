@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<meta name="description" content="Searchable reference for {{COUNT}} PostGIS ST_* functions and spatial operators, with SQL, psycopg and GeoAlchemy2 examples.">
+<style>
+{{STYLE}}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#cards">Skip to functions</a>
+
+<header class="masthead">
+  <div class="masthead__row">
+    <h1 class="brand">ST_* cheatsheet<small>{{COUNT}} PostGIS functions and operators</small></h1>
+
+    <div class="search-wrap">
+      <label class="visually-hidden" for="search">Search functions</label>
+      <input id="search" type="search" autocomplete="off" spellcheck="false"
+             placeholder="Search name, summary or tag&hellip;"
+             role="combobox" aria-expanded="true" aria-controls="index-list"
+             aria-describedby="status">
+    </div>
+
+    <div class="controls">
+      <label class="visually-hidden" for="category">Category</label>
+      <select id="category">
+        <option value="all">All categories</option>
+{{CATEGORY_OPTIONS}}
+      </select>
+
+      <label class="toggle" for="index-only">
+        <input id="index-only" type="checkbox">
+        GiST-indexable only
+      </label>
+
+      <p class="status" id="status" role="status" aria-live="polite">{{COUNT}} functions</p>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="index" aria-label="Function index">
+    <ul id="index-list" role="listbox" aria-label="Matching functions">
+{{INDEX_ITEMS}}
+    </ul>
+  </nav>
+
+  <main id="cards" class="cards">
+{{CARDS}}
+  </main>
+
+  <p id="empty" class="empty hidden" role="status">
+    Nothing matches those filters. Clear the search with <kbd>Esc</kbd> or reset the category.
+  </p>
+</div>
+
+<footer class="pagefoot">
+  <p>
+    Generated {{GENERATED}} from the <code>data/functions/</code> dataset.
+    Press <kbd>/</kbd> to search, <kbd>&uarr;</kbd><kbd>&darr;</kbd> to move through results,
+    <kbd>Enter</kbd> to jump to a card.
+  </p>
+  <p>
+    Results shown are from PostGIS on PostgreSQL; version-specific behaviour is noted per entry.
+    This page is entirely self-contained and makes no network requests.
+  </p>
+</footer>
+
+<script id="cheatsheet-data" type="application/json">{{DATA_JSON}}</script>
+<script>
+window.__ST_CHEATSHEET__ = JSON.parse(document.getElementById("cheatsheet-data").textContent);
+</script>
+<script>
+{{SCRIPT}}
+</script>
+</body>
+</html>

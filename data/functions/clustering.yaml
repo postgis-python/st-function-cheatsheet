@@ -1,0 +1,264 @@
+# Clustering and spatial partitioning. Two window functions that label rows with a cluster id,
+# plus the Voronoi tessellation that turns a point set into proximity polygons.
+
+- name: ST_ClusterDBSCAN
+  category: processing
+  signatures:
+    - "ST_ClusterDBSCAN(geom geometry, eps float8, minpoints integer) OVER () -> integer"
+  summary: >-
+    A window function that assigns each input row a DBSCAN cluster id based on density:
+    points within eps of each other form a cluster provided enough of them are packed
+    together to satisfy minpoints. Unlike k-means you do not have to know the number of
+    clusters in advance, and shapes can be arbitrary rather than roughly circular. Rows
+    that belong to no cluster get NULL rather than an id, which makes it a practical
+    noise filter for GPS traces, crime points or sensor readings. Reach for it when the
+    question is "which of these features are grouped together" rather than "split these
+    into N groups".
+  returns: integer
+  since: "2.3"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The window input geometry, one per row; typically a point column.
+    - name: eps
+      type: float8
+      description: Neighbourhood radius in SRID units. Two geometries within eps are directly reachable.
+    - name: minpoints
+      type: integer
+      description: Minimum number of geometries within eps (including the geometry itself) for it to be a core point.
+  example:
+    sql: |-
+      SELECT id, ST_ClusterDBSCAN(geom, eps => 1, minpoints => 2) OVER () AS cid
+      FROM (VALUES
+        (1, 'POINT(0 0)'::geometry),
+        (2, 'POINT(0.5 0)'::geometry),
+        (3, 'POINT(10 10)'::geometry)
+      ) AS t(id, geom)
+      ORDER BY id;
+    result: |2-
+       id | cid
+      ----+-----
+        1 |   0
+        2 |   0
+        3 |
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_ClusterDBSCAN(geom, %s, %s) OVER () AS cluster_id
+              FROM incidents
+              WHERE reported_at >= %s
+              """,
+              (eps_metres, min_points, since),
+          )
+          labelled = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_ClusterDBSCAN
+
+      cid = ST_ClusterDBSCAN(Incident.geom, 250, 5).over().label("cluster_id")
+      stmt = select(Incident.id, cid)
+  srid_notes: >-
+    eps is expressed in the units of the column's SRID, so on 4326 you are asking for a
+    radius in degrees - roughly 111 km per degree of latitude and much less per degree of
+    longitude away from the equator, which distorts clusters north-south. There is no
+    geography overload, so for a metric eps either store or ST_Transform to a projected
+    SRID (a local UTM zone or 3857 with its latitude-dependent scale factor understood)
+    before clustering. Transforming inside the window call is fine here because the
+    function scans the whole partition anyway.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      Window functions cannot use an index for the clustering itself; PostGIS builds an
+      in-memory index over each partition. Keep the WHERE clause that feeds the window
+      selective and indexed, and use PARTITION BY on a cheap key so each partition stays
+      small - memory and time grow with partition size.
+  common_mistakes:
+    - "Forgetting the OVER () clause. Without it PostgreSQL reports that ST_ClusterDBSCAN can only be used as a window function."
+    - "Treating NULL cluster ids as an error. NULL is DBSCAN noise - points that never reached minpoints neighbours - and must be filtered or bucketed deliberately."
+    - "Passing eps in metres against a 4326 column, which silently clusters everything into one blob because a degree is enormous."
+    - "Expecting stable ids across runs; the numbering is an implementation detail and only the grouping is meaningful."
+  see_also:
+    - ST_ClusterKMeans
+    - ST_DWithin
+    - ST_Collect
+    - ST_ConvexHull
+    - ST_Transform
+  tags: [clustering, dbscan, window-function, density, points]
+
+- name: ST_ClusterKMeans
+  category: processing
+  signatures:
+    - "ST_ClusterKMeans(geom geometry, k integer) OVER () -> integer"
+    - "ST_ClusterKMeans(geom geometry, k integer, max_radius float8) OVER () -> integer"
+  summary: >-
+    A window function that partitions the input rows into exactly k clusters by k-means
+    on the geometries' centroids, returning a cluster id from 0 to k-1. Every row gets an
+    id - there is no noise class - so it is the tool for "split this into N territories"
+    problems such as sales regions, delivery zones or map label decluttering. Because it
+    minimises squared distance to a centre it favours compact, roughly equal-extent
+    groups and will happily cut through a genuinely elongated cluster. Use it when k is a
+    business constraint; use DBSCAN when the data should tell you how many groups exist.
+  returns: integer
+  since: "2.3"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The window input geometry, one per row. Non-point inputs are reduced to their centroid.
+    - name: k
+      type: integer
+      description: The exact number of clusters to produce.
+    - name: max_radius
+      type: float8
+      description: Optional cap on cluster radius in SRID units; clusters are split further to respect it. PostGIS 3.2+.
+      optional: true
+  example:
+    sql: |-
+      SELECT cid, count(*) AS n
+      FROM (
+        SELECT ST_ClusterKMeans(geom, 2) OVER () AS cid
+        FROM (VALUES
+          ('POINT(0 0)'::geometry),
+          ('POINT(1 0)'::geometry),
+          ('POINT(50 50)'::geometry),
+          ('POINT(51 50)'::geometry)
+        ) AS t(geom)
+      ) s
+      GROUP BY cid
+      ORDER BY cid;
+    result: |2-
+       cid | n
+      -----+---
+         0 | 2
+         1 | 2
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT customer_id,
+                     ST_ClusterKMeans(geom, %s) OVER (PARTITION BY depot_id) AS zone
+              FROM deliveries
+              """,
+              (num_zones,),
+          )
+          zones = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_ClusterKMeans
+
+      zone = ST_ClusterKMeans(Delivery.geom, 8).over(
+          partition_by=Delivery.depot_id
+      ).label("zone")
+      stmt = select(Delivery.id, zone)
+  srid_notes: >-
+    k-means minimises planar squared distance in SRID units, so running it on 4326 means
+    minimising a mix of degrees of latitude and degrees of longitude that are not the same
+    length on the ground. The resulting territories are stretched east-west at high
+    latitudes. Transform to an equal-area or local projected SRID first if the clusters
+    are meant to represent comparable real-world areas; max_radius, when used, is in those
+    same SRID units.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      No index participates in the clustering. The cost is driven by the number of rows in
+      each window partition, so filter first and consider PARTITION BY to keep the problem
+      bounded rather than clustering an entire table in one pass.
+  common_mistakes:
+    - "Omitting OVER (), which raises an error because this is a window function, not a scalar one."
+    - "Assuming cluster id 0 means anything - unlike DBSCAN there is no noise class, and ids are arbitrary labels that can change between runs."
+    - "Choosing k blindly and reading the output as natural groupings; k-means will split or merge whatever it must to produce exactly k clusters."
+    - "Feeding polygons and expecting area-aware clustering; only the centroid of each input is used."
+  see_also:
+    - ST_ClusterDBSCAN
+    - ST_Centroid
+    - ST_VoronoiPolygons
+    - ST_Collect
+    - ST_Transform
+  tags: [clustering, kmeans, window-function, partitioning, territories]
+
+- name: ST_VoronoiPolygons
+  category: processing
+  signatures:
+    - "ST_VoronoiPolygons(geom geometry, tolerance float8 = 0.0, extend_to geometry = NULL) -> geometry"
+  summary: >-
+    Computes the Voronoi diagram of the vertices of the input geometry, returning a
+    GeometryCollection with one convex polygon per input point - the region closer to that
+    point than to any other. It is the standard way to turn a scatter of sample sites into
+    a wall-to-wall coverage: catchment areas around shops or hospitals, nearest-gauge
+    zones for rainfall interpolation, or a Thiessen weighting for sparse sensors. Unlike
+    the clustering window functions it is an aggregate-style operation on a single
+    collected geometry, so you normally feed it ST_Collect of your point column. The
+    diagram is unbounded by nature, so PostGIS clips it to an expanded envelope unless you
+    supply extend_to.
+  returns: geometry
+  since: "2.3"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The input geometry whose vertices seed the diagram; usually a MultiPoint from ST_Collect.
+    - name: tolerance
+      type: float8
+      description: Snapping distance in SRID units for the underlying triangulation; 0 means no snapping.
+      optional: true
+    - name: extend_to
+      type: geometry
+      description: Geometry whose envelope the diagram is extended to; defaults to the input envelope expanded by about 50 percent.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_NumGeometries(
+               ST_VoronoiPolygons('MULTIPOINT(0 0, 1 0, 0 1, 1 1)'::geometry)
+             ) AS cells;
+    result: |2-
+       cells
+      -------
+           4
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT ST_AsGeoJSON(cell.geom)
+              FROM (
+                SELECT (ST_Dump(ST_VoronoiPolygons(ST_Collect(geom), 0, %s::geometry))).geom
+                FROM gauges
+              ) AS cell
+              """,
+              (study_area_ewkt,),
+          )
+          catchments = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Collect, ST_VoronoiPolygons
+
+      stmt = select(ST_VoronoiPolygons(ST_Collect(Gauge.geom)))
+  srid_notes: >-
+    The output inherits the SRID of the input, but the geometry is built by a purely
+    planar algorithm, so on 4326 the cell boundaries are degree-space bisectors rather
+    than true great-circle equidistance lines - noticeably wrong over large or
+    high-latitude extents. Project to a local equidistant or UTM SRID before building the
+    diagram and transform the result back if you need it in 4326. tolerance and the
+    extend_to envelope are likewise in the input SRID's units.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      Not an indexable predicate; it is a single expensive computation over a collected
+      geometry. Index the source column so the ST_Collect input can be restricted by area,
+      and GiST-index the materialised cells afterwards if you intend to join against them.
+  common_mistakes:
+    - "Calling it per row instead of on ST_Collect of the whole point set, which yields one degenerate cell per row."
+    - "Forgetting to ST_Dump the result; it is a single GeometryCollection, not a set of rows, so a naive join sees one giant geometry."
+    - "Ignoring extend_to and then wondering why the outer cells stop short of the study area boundary - clip with ST_Intersection or pass extend_to."
+    - "Assuming duplicate input points each get a cell; coincident vertices collapse and the cell count will be lower than the row count."
+  see_also:
+    - ST_Collect
+    - ST_ConvexHull
+    - ST_Intersection
+    - ST_ClusterKMeans
+    - ST_Dimension
+  tags: [voronoi, thiessen, tessellation, catchment, points]

@@ -1,0 +1,736 @@
+# Geometry constructors: the functions that turn coordinates, text, JSON and binary
+# blobs into geometry values. Where your SRIDs are set - or silently left unset.
+
+- name: ST_MakePoint
+  category: constructors
+  signatures:
+    - "ST_MakePoint(float x, float y) -> geometry"
+    - "ST_MakePoint(float x, float y, float z) -> geometry"
+    - "ST_MakePoint(float x, float y, float z, float m) -> geometry"
+  summary: >-
+    Builds a point geometry from raw ordinates. It is the fastest way to get a point
+    into the database from numeric columns or bound parameters, because nothing is
+    parsed - the coordinates go straight into the geometry. Reach for it whenever you
+    have longitude and latitude as floats rather than as text, which is the normal case
+    when writing from Python. It is also the only constructor family that reaches the
+    M ordinate, so linear-referencing workflows start here.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: x
+      type: float
+      description: X ordinate - longitude, or easting in a projected CRS. Always first.
+    - name: y
+      type: float
+      description: Y ordinate - latitude, or northing.
+    - name: z
+      type: float
+      description: Optional Z ordinate, producing a PointZ.
+      optional: true
+    - name: m
+      type: float
+      description: Optional measure value; supplying it requires z and produces a PointZM.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_MakePoint(-71.064, 42.288)) AS wkt,
+             ST_SRID(ST_MakePoint(-71.064, 42.288)) AS srid;
+    result: |2-
+                wkt           | srid
+      -----------------------+------
+       POINT(-71.064 42.288) |    0
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              INSERT INTO sightings (species, geom)
+              VALUES (%s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+              RETURNING id
+              """,
+              (species, lon, lat),
+          )
+          (new_id,) = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_MakePoint, ST_SetSRID
+
+      here = ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+      stmt = select(Sighting.id).where(Sighting.geom.ST_DWithin(here, 0.01))
+  srid_notes: >-
+    ST_MakePoint always returns SRID 0, no matter what the surrounding column's SRID is.
+    Inserting it directly into a typmod-constrained geometry(Point,4326) column raises
+    "Geometry SRID (0) does not match column SRID (4326)", so it is almost always wrapped
+    in ST_SetSRID. Note that ST_SetSRID only labels the coordinates, it does not convert
+    them - if the floats are degrees and the column is 3857 you need ST_Transform after
+    the ST_SetSRID, not instead of it.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      A constructor, not a predicate. It is safe on the constant side of an indexed
+      comparison because it folds to a constant per query; only a column-derived
+      argument would force per-row evaluation.
+  common_mistakes:
+    - "Forgetting ST_SetSRID and ending up with a table of SRID 0 points that no ST_Transform or geography cast can rescue."
+    - "Swapping the arguments: GeoJSON and most APIs give (lon, lat) but humans say 'lat, lon', and ST_MakePoint takes X first."
+    - "Using ST_SetSRID(ST_MakePoint(x, y), 4326) on coordinates that were actually in a projected CRS, which mislabels rather than converts them."
+  see_also:
+    - ST_Point
+    - ST_SetSRID
+    - ST_Transform
+    - ST_MakeLine
+    - ST_X
+  tags: [point, constructor, coordinates, srid]
+
+- name: ST_Point
+  category: constructors
+  signatures:
+    - "ST_Point(float x, float y) -> geometry"
+    - "ST_Point(float x, float y, integer srid) -> geometry"
+  summary: >-
+    The SQL/MM-standard point constructor, functionally the same as the two-argument
+    ST_MakePoint. Since PostGIS 3.2 it also accepts an SRID as a third argument, which
+    removes the near-universal ST_SetSRID wrapper and is the reason to prefer it in new
+    code. Companion functions ST_PointZ, ST_PointM and ST_PointZM cover the higher
+    dimensions with the same optional-SRID convenience. On PostGIS 3.1 and older only
+    the two-argument form exists.
+  returns: geometry
+  since: "1.0 (srid argument since 3.2)"
+  arguments:
+    - name: x
+      type: float
+      description: X ordinate - longitude or easting.
+    - name: y
+      type: float
+      description: Y ordinate - latitude or northing.
+    - name: srid
+      type: integer
+      description: SRID to stamp on the result. PostGIS 3.2+ only; omitted means SRID 0.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsEWKT(ST_Point(-71.064, 42.288, 4326)) AS ewkt;
+    result: |2-
+                    ewkt
+      ---------------------------------
+       SRID=4326;POINT(-71.064 42.288)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "INSERT INTO stops (name, geom) VALUES (%s, ST_Point(%s, %s, 4326))",
+              (name, lon, lat),
+          )
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Point
+
+      origin = ST_Point(lon, lat, 4326)
+      stmt = select(Stop.name).order_by(Stop.geom.distance_centroid(origin)).limit(5)
+  srid_notes: >-
+    With the third argument this is the one point constructor that does not leave you at
+    SRID 0. The SRID is still only a label: passing 4326 with metre-scale eastings
+    produces a geometry that every subsequent geography cast and ST_Distance will
+    misinterpret. If your application targets PostGIS 3.1 or earlier, the three-argument
+    call fails with "function st_point(numeric, numeric, integer) does not exist" - keep
+    ST_SetSRID for portability.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Constructor only. Used as the constant side of ST_DWithin or a KNN ORDER BY it is
+      evaluated once and the index on the column is still used.
+  common_mistakes:
+    - "Assuming the three-argument form exists everywhere; it is PostGIS 3.2+ and will break against older servers."
+    - "Reversing latitude and longitude, which is not an error on 4326 but places points in the wrong hemisphere."
+    - "Believing the srid argument reprojects. It only tags; use ST_Transform to actually convert coordinates."
+  see_also:
+    - ST_MakePoint
+    - ST_SetSRID
+    - ST_Transform
+    - ST_SRID
+  tags: [point, constructor, srid, sql-mm]
+
+- name: ST_MakeLine
+  category: constructors
+  signatures:
+    - "ST_MakeLine(geometry geom1, geometry geom2) -> geometry"
+    - "ST_MakeLine(geometry[] geoms_array) -> geometry"
+    - "ST_MakeLine(geometry set geoms) -> geometry"
+  summary: >-
+    Stitches points, multipoints and linestrings together into a single linestring, in
+    the order given. The aggregate form is the workhorse: given a table of GPS fixes
+    with a timestamp, ST_MakeLine(geom ORDER BY recorded_at) turns them into a track in
+    one pass. Use it whenever you need to reconstruct a path from ordered point rows,
+    or to join a handful of segments end to end.
+  returns: geometry (LineString)
+  since: "1.0 (geomarray form since 1.4; LineString inputs since 2.0; MultiPoint inputs since 2.3)"
+  arguments:
+    - name: geom1
+      type: geometry
+      description: First input - a Point, MultiPoint or LineString.
+    - name: geom2
+      type: geometry
+      description: Second input, appended after the first.
+    - name: geoms_array
+      type: geometry[]
+      description: Array form; vertices are taken in array order.
+      optional: true
+    - name: geoms
+      type: geometry set
+      description: Aggregate form; order is undefined unless you add ORDER BY inside the aggregate.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_MakeLine('POINT(0 0)'::geometry, 'POINT(3 4)'::geometry)) AS wkt,
+             ST_Length(ST_MakeLine('POINT(0 0)'::geometry, 'POINT(3 4)'::geometry)) AS len;
+    result: |2-
+               wkt         | len
+      ---------------------+-----
+       LINESTRING(0 0,3 4) |   5
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT device_id,
+                     ST_MakeLine(geom ORDER BY recorded_at) AS track
+              FROM gps_fixes
+              WHERE recorded_at >= %s
+              GROUP BY device_id
+              """,
+              (since,),
+          )
+          tracks = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from sqlalchemy.dialects.postgresql import aggregate_order_by
+      from geoalchemy2.functions import ST_MakeLine
+
+      track = ST_MakeLine(aggregate_order_by(GpsFix.geom, GpsFix.recorded_at))
+      stmt = select(GpsFix.device_id, track.label("track")).group_by(GpsFix.device_id)
+  srid_notes: >-
+    All inputs must share one SRID; mixing them raises "Operation on mixed SRID
+    geometries", and the result inherits that SRID. The resulting ST_Length is in SRID
+    units, so a track built from 4326 points measures in degrees - cast the line to
+    geography or ST_Transform it to a local projection before reporting a distance
+    travelled.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Constructor and aggregate; nothing to index. The aggregate form benefits from an
+      index on the grouping and ordering columns (device_id, recorded_at) rather than
+      from a spatial index.
+  common_mistakes:
+    - "Using the aggregate without ORDER BY inside it, which produces a zig-zag line in whatever order the scan happened to return rows."
+    - "Feeding it two identical points, which yields a zero-length linestring that many predicates and ST_Azimuth then choke on."
+    - "Expecting duplicate consecutive points to be removed - only repeated nodes at the start of LineString inputs are collapsed; use ST_RemoveRepeatedPoints otherwise."
+  see_also:
+    - ST_MakePoint
+    - ST_MakePolygon
+    - ST_RemoveRepeatedPoints
+    - ST_Length
+    - ST_Collect
+  tags: [linestring, constructor, aggregate, tracks]
+
+- name: ST_MakePolygon
+  category: constructors
+  signatures:
+    - "ST_MakePolygon(geometry linestring) -> geometry"
+    - "ST_MakePolygon(geometry outerlinestring, geometry[] interiorlinestrings) -> geometry"
+  summary: >-
+    Turns a closed linestring into a polygon, optionally punching holes with an array of
+    further closed linestrings. It is the natural second step after ST_MakeLine when you
+    are building an area from ordered boundary points, and the standard way to construct
+    a polygon with interior rings, which no WKT-free alternative offers. The input rings
+    are used as given - no validation, no noding, no self-intersection repair.
+  returns: geometry (Polygon)
+  since: "1.0"
+  arguments:
+    - name: linestring
+      type: geometry
+      description: A closed LineString to use as the shell. Start and end points must be identical.
+    - name: outerlinestring
+      type: geometry
+      description: Closed LineString forming the exterior ring, in the two-argument form.
+    - name: interiorlinestrings
+      type: geometry[]
+      description: Array of closed LineStrings forming holes. A NULL array yields NULL.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_Area(ST_MakePolygon('LINESTRING(0 0, 0 10, 10 10, 10 0, 0 0)'::geometry)) AS area;
+    result: |2-
+       area
+      ------
+        100
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              INSERT INTO zones (name, geom)
+              SELECT %s, ST_MakePolygon(ST_MakeLine(geom ORDER BY seq))
+              FROM zone_vertices WHERE zone_key = %s
+              """,
+              (name, zone_key),
+          )
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Area, ST_MakePolygon
+
+      stmt = select(ST_Area(ST_MakePolygon(Boundary.ring))).where(Boundary.id == boundary_id)
+  srid_notes: >-
+    The polygon takes the SRID of the shell linestring, and every hole must carry that
+    same SRID. Because there is no validity check, a ring digitised in 4326 and one in
+    3857 will not be silently reconciled - they error. The ST_Area of the result is in
+    squared SRID units, which on 4326 is square degrees and meaningless; transform first
+    or cast to geography.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Constructor only. If you are materialising the polygons into a column, build the
+      GiST index after the bulk insert rather than before.
+  common_mistakes:
+    - "Passing an open linestring, which raises 'Geometry must be a closed linestring' - close it with ST_AddPoint(line, ST_StartPoint(line)) first."
+    - "Passing a MultiLineString, which is rejected; run ST_LineMerge or ST_Dump to get single rings."
+    - "Assuming the result is valid. Self-intersecting or wrongly-nested rings produce an invalid polygon that only ST_IsValid will reveal - run ST_MakeValid before storing."
+  see_also:
+    - ST_MakeLine
+    - ST_MakeValid
+    - ST_IsValid
+    - ST_MakeEnvelope
+    - ST_Area
+  tags: [polygon, constructor, rings, holes]
+
+- name: ST_MakeEnvelope
+  category: constructors
+  signatures:
+    - "ST_MakeEnvelope(float xmin, float ymin, float xmax, float ymax, integer srid) -> geometry"
+  summary: >-
+    Creates an axis-aligned rectangular polygon from four corner ordinates plus an SRID.
+    This is how you build a viewport or map-extent geometry to hand to && or ST_Intersects,
+    and it is far cheaper and clearer than assembling the WKT for a five-vertex ring by
+    hand. Because it produces a real polygon rather than a box type, it can be used
+    anywhere a geometry is accepted, including as the bounds argument to ST_TileEnvelope.
+  returns: geometry (Polygon)
+  since: "1.5 (srid optional since 2.0)"
+  arguments:
+    - name: xmin
+      type: float
+      description: Minimum X of the rectangle, in SRID units.
+    - name: ymin
+      type: float
+      description: Minimum Y of the rectangle.
+    - name: xmax
+      type: float
+      description: Maximum X of the rectangle.
+    - name: ymax
+      type: float
+      description: Maximum Y of the rectangle.
+    - name: srid
+      type: integer
+      description: SRID for the result. Omitting it yields SRID 0 (unknown).
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_MakeEnvelope(0, 0, 10, 10, 3857)) AS wkt;
+    result: |2-
+                        wkt
+      ------------------------------------
+       POLYGON((0 0,0 10,10 10,10 0,0 0))
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, name FROM parcels
+              WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 27700)
+              """,
+              (xmin, ymin, xmax, ymax),
+          )
+          in_view = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_MakeEnvelope
+
+      viewport = ST_MakeEnvelope(xmin, ymin, xmax, ymax, 27700)
+      stmt = select(Parcel.id, Parcel.name).where(Parcel.geom.intersects(viewport))
+  srid_notes: >-
+    Always pass the SRID explicitly and always make it match the indexed column - that
+    is the whole point of this function. Building the envelope in the column's SRID lets
+    the GiST index serve the query; transforming the column instead to match a 4326
+    envelope makes the index unusable. Note the rectangle is axis-aligned in the target
+    CRS, so an envelope built in 4326 and transformed to 3857 is no longer a rectangle
+    at its edges unless you ST_Segmentize it first.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not indexable itself, but it is the canonical constant operand for an indexed &&,
+      @ or ST_Intersects. It folds to a constant, so the planner can use the index on
+      the column it is compared against.
+  common_mistakes:
+    - "Getting the argument order wrong - it is (xmin, ymin, xmax, ymax), not (xmin, xmax, ymin, ymax)."
+    - "Omitting the SRID and then comparing against an SRID-bearing column, which errors on mixed SRIDs."
+    - "Transforming the indexed column to the envelope's SRID instead of building the envelope in the column's SRID, which discards the index."
+  see_also:
+    - "&&"
+    - ST_TileEnvelope
+    - ST_Envelope
+    - ST_Expand
+    - ST_Transform
+  tags: [envelope, bbox, viewport, constructor, srid]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: ST_GeomFromText
+  category: constructors
+  signatures:
+    - "ST_GeomFromText(text WKT) -> geometry"
+    - "ST_GeomFromText(text WKT, integer srid) -> geometry"
+  summary: >-
+    Parses OGC Well-Known Text into a geometry. It is the portable, standards-defined
+    entry point for geometry literals and the one to use when the coordinates arrive as
+    strings from a file, an API or a test fixture. The two-argument form is what you
+    almost always want, because plain WKT carries no coordinate reference system of its
+    own. Parsing is comparatively slow, so for bulk loads prefer WKB or a COPY of the
+    binary representation.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: WKT
+      type: text
+      description: OGC Well-Known Text, e.g. 'POLYGON((0 0, 0 1, 1 1, 0 0))'. Curves are supported.
+    - name: srid
+      type: integer
+      description: SRID to assign to the parsed geometry. Omitted means SRID 0.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_SRID(ST_GeomFromText('POINT(0 0)')) AS no_srid,
+             ST_SRID(ST_GeomFromText('POINT(0 0)', 4326)) AS with_srid;
+    result: |2-
+       no_srid | with_srid
+      ---------+-----------
+             0 |      4326
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "UPDATE boundaries SET geom = ST_GeomFromText(%s, 4326) WHERE code = %s",
+              (wkt, code),
+          )
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_GeomFromText
+
+      aoi = ST_GeomFromText(wkt, 4326)
+      stmt = select(Boundary.code).where(Boundary.geom.ST_Intersects(aoi))
+  srid_notes: >-
+    WKT is SRID-free by definition, so the one-argument form always produces SRID 0 and
+    will be rejected by a typmod-constrained column. Supplying the srid argument only
+    labels the coordinates; if the WKT holds British National Grid eastings you must
+    pass 27700, not 4326, or every later distance and transform is wrong. If your string
+    already begins with 'SRID=...;' it is EWKT, not WKT - use ST_GeomFromEWKT.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Constructor. With a literal or bound parameter it is a stable expression, so
+      WHERE geom && ST_GeomFromText(%s, 4326) still uses the GiST index on geom.
+  common_mistakes:
+    - "Omitting the SRID argument and later discovering an entire column of SRID 0 geometries."
+    - "Feeding it EWKT with an 'SRID=4326;' prefix, which fails to parse; that input needs ST_GeomFromEWKT."
+    - "Building the WKT string with Python f-strings instead of passing it as a bound parameter, which is both slower and an injection risk."
+  see_also:
+    - ST_GeomFromEWKT
+    - ST_GeomFromWKB
+    - ST_AsText
+    - ST_SetSRID
+  tags: [wkt, parsing, constructor, srid, text]
+
+- name: ST_GeomFromEWKT
+  category: constructors
+  signatures:
+    - "ST_GeomFromEWKT(text EWKT) -> geometry"
+  summary: >-
+    Parses PostGIS Extended WKT - ordinary WKT with an 'SRID=nnnn;' prefix and support
+    for Z and M ordinates. Use it when the SRID travels with the string rather than
+    being known separately, which is exactly what ST_AsEWKT emits, making the pair a
+    lossless round trip for debugging, fixtures and copying geometries between databases.
+    It is a PostGIS extension, not an OGC standard, so do not expect other spatial
+    databases to accept the same strings.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: EWKT
+      type: text
+      description: Extended WKT such as 'SRID=27700;POINTZ(545000 258000 12)'. The SRID prefix is optional.
+  example:
+    sql: |-
+      SELECT ST_SRID(ST_GeomFromEWKT('SRID=27700;POINT(545000 258000)')) AS srid;
+    result: |2-
+       srid
+      -------
+       27700
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "INSERT INTO fixtures (label, geom) VALUES (%s, ST_GeomFromEWKT(%s))",
+              (label, "SRID=4326;POINT(-0.1276 51.5072)"),
+          )
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsEWKT, ST_GeomFromEWKT
+
+      probe = ST_GeomFromEWKT("SRID=4326;POINT(-0.1276 51.5072)")
+      stmt = select(ST_AsEWKT(Fixture.geom)).where(Fixture.geom.ST_DWithin(probe, 0.05))
+  srid_notes: >-
+    This is the one text constructor where the SRID is carried in the input, so there is
+    no separate srid argument to forget. Drop the prefix, however, and you silently get
+    SRID 0 - the function does not complain. Because the SRID is embedded, a string
+    copied between databases keeps meaning only if both have the same entry in
+    spatial_ref_sys, which matters for custom SRIDs above 900000.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Constructor. Constant-folds like the other parsers, so it is fine on the literal
+      side of an indexed spatial predicate.
+  common_mistakes:
+    - "Passing a string with no SRID= prefix and assuming the column's SRID is inherited; you get SRID 0."
+    - "Using EWKT as an interchange format with non-PostGIS tools, which do not understand the SRID prefix or the Z/M extensions."
+    - "Reaching for it in bulk loaders where the SRID is constant anyway - ST_GeomFromWKB with an srid argument is much faster."
+  see_also:
+    - ST_GeomFromText
+    - ST_AsEWKT
+    - ST_SRID
+    - ST_GeomFromWKB
+  tags: [ewkt, parsing, constructor, srid, postgis-specific]
+
+- name: ST_GeomFromGeoJSON
+  category: constructors
+  signatures:
+    - "ST_GeomFromGeoJSON(text geomjson) -> geometry"
+    - "ST_GeomFromGeoJSON(json geomjson) -> geometry"
+    - "ST_GeomFromGeoJSON(jsonb geomjson) -> geometry"
+  summary: >-
+    Parses a GeoJSON geometry fragment into a PostGIS geometry. It is the shortest path
+    from a web API payload or a Python dict to a stored geometry, and the json/jsonb
+    overloads mean you can feed it a jsonb column or psycopg's Jsonb adapter directly.
+    Note the word fragment: it accepts only the geometry object, not a Feature or a
+    FeatureCollection, so you must reach into the document first. The function requires
+    a PostGIS built with JSON-C, which all mainstream packages are.
+  returns: geometry
+  since: "2.0 (json/jsonb input since 2.5; defaults to SRID 4326 since 3.0)"
+  arguments:
+    - name: geomjson
+      type: text | json | jsonb
+      description: A GeoJSON geometry object, e.g. {"type":"Point","coordinates":[1,2]}. Not a Feature or FeatureCollection.
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"Point","coordinates":[1,2]}')) AS wkt,
+             ST_SRID(ST_GeomFromGeoJSON('{"type":"Point","coordinates":[1,2]}')) AS srid;
+    result: |2-
+          wkt     | srid
+      ------------+------
+       POINT(1 2) | 4326
+    psycopg: |-
+      from psycopg.types.json import Jsonb
+
+      with conn.cursor() as cur:
+          cur.execute(
+              "INSERT INTO features (props, geom) VALUES (%s, ST_GeomFromGeoJSON(%s))",
+              (Jsonb(feature["properties"]), Jsonb(feature["geometry"])),
+          )
+    geoalchemy: |-
+      import json
+
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_GeomFromGeoJSON
+
+      aoi = ST_GeomFromGeoJSON(json.dumps(geojson_geometry))
+      stmt = select(Feature.id).where(Feature.geom.ST_Intersects(aoi))
+  srid_notes: >-
+    From PostGIS 3.0 the result is stamped SRID 4326, which matches the GeoJSON spec's
+    requirement that coordinates be WGS 84 longitude/latitude. On PostGIS 2.x the result
+    came back as SRID 0, so code that must run on both should wrap the call in
+    ST_SetSRID(..., 4326) explicitly. PostGIS ignores any legacy "crs" member in the
+    input, so GeoJSON carrying projected coordinates under a crs block will be mislabelled
+    as 4326 - transform it before trusting it.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Constructor. Parsing is relatively expensive, so if you filter with it in a loop
+      parse once into a CTE or a bound geometry parameter rather than per row.
+  common_mistakes:
+    - "Passing a whole Feature or FeatureCollection instead of the inner geometry object, which raises a parse error."
+    - "Assuming SRID 4326 on PostGIS 2.x, where the result is SRID 0."
+    - "Trusting the input's crs member; PostGIS ignores it and labels everything 4326."
+  see_also:
+    - ST_AsGeoJSON
+    - ST_GeomFromText
+    - ST_SetSRID
+    - ST_Transform
+  tags: [geojson, parsing, constructor, json, srid]
+  docs_url: https://www.postgis-python.com/sqlalchemy-and-geoalchemy-integration-workflows/
+
+- name: ST_GeomFromWKB
+  category: constructors
+  signatures:
+    - "ST_GeomFromWKB(bytea geom) -> geometry"
+    - "ST_GeomFromWKB(bytea geom, integer srid) -> geometry"
+  summary: >-
+    Parses OGC Well-Known Binary into a geometry. It is the fastest text-free ingestion
+    path: no decimal formatting, no re-parsing of digits, and no precision loss from
+    round-tripping floats through strings. Reach for it in bulk loaders, when reading
+    geometries produced by Shapely's wkb property, or when moving data between systems
+    that both speak WKB. Since psycopg sends bytea natively, the Python side is just a
+    bytes object.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: geom
+      type: bytea
+      description: OGC WKB. Both big- and little-endian encodings are accepted.
+    - name: srid
+      type: integer
+      description: SRID to assign. Omitted means SRID 0.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_GeomFromWKB(ST_AsBinary('POINT(1 2)'::geometry), 4326)) AS wkt,
+             ST_SRID(ST_GeomFromWKB(ST_AsBinary('POINT(1 2)'::geometry), 4326)) AS srid;
+    result: |2-
+          wkt     | srid
+      ------------+------
+       POINT(1 2) | 4326
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.executemany(
+              "INSERT INTO tracks (name, geom) VALUES (%s, ST_GeomFromWKB(%s, 4326))",
+              [(name, shapely_geom.wkb) for name, shapely_geom in batch],
+          )
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_GeomFromWKB
+
+      probe = ST_GeomFromWKB(shapely_geom.wkb, 4326)
+      stmt = select(Track.id).where(Track.geom.ST_Intersects(probe))
+  srid_notes: >-
+    Plain OGC WKB carries no SRID, so without the second argument you get SRID 0 exactly
+    as with ST_GeomFromText. PostGIS also emits an extended EWKB that does embed the SRID
+    - that is what ST_AsEWKB produces and what ST_GeomFromEWKB reads, and it is also what
+    a geometry column's raw binary output looks like. Passing EWKB to ST_GeomFromWKB
+    generally works, but the srid argument then conflicts with the embedded one, so pick
+    one convention per pipeline.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Constructor. Because it is far cheaper than WKT parsing it is the right choice
+      inside large COPY-then-transform loads, where parse cost can dominate index build
+      time.
+  common_mistakes:
+    - "Passing a hex string as text rather than real bytea, which either errors or silently double-encodes."
+    - "Omitting the srid argument in a bulk load and having to run a slow UPDATE ... ST_SetSRID afterwards."
+    - "Assuming Shapely's .wkb preserves an SRID; it does not - Shapely geometries are CRS-free, so you must supply the srid here."
+  see_also:
+    - ST_AsBinary
+    - ST_GeomFromText
+    - ST_GeomFromEWKT
+    - ST_SetSRID
+  tags: [wkb, binary, parsing, constructor, bulk-load]
+  docs_url: https://www.postgis-python.com/sqlalchemy-and-geoalchemy-integration-workflows/
+
+- name: ST_TileEnvelope
+  category: constructors
+  signatures:
+    - "ST_TileEnvelope(integer tileZoom, integer tileX, integer tileY, geometry bounds, float margin) -> geometry"
+  summary: >-
+    Computes the rectangular extent of an XYZ map tile from its zoom/x/y coordinates.
+    It exists so that a vector-tile endpoint can go straight from the /{z}/{x}/{y} path
+    parameters to a geometry, without hand-rolling the Web Mercator arithmetic. In
+    practice it is the first line of almost every ST_AsMVT query: build the tile
+    envelope, filter the table against it with &&, then clip with ST_AsMVTGeom. The
+    margin argument, added in 3.1, expands the envelope by a fraction of tile width so
+    that labels and buffered features straddling the edge are still fetched.
+  returns: geometry (Polygon)
+  since: "3.0 (margin argument since 3.1)"
+  arguments:
+    - name: tileZoom
+      type: integer
+      description: XYZ zoom level; the world is divided into 2^zoom tiles per axis.
+    - name: tileX
+      type: integer
+      description: Tile column, 0 at the west edge of the bounds.
+    - name: tileY
+      type: integer
+      description: Tile row, 0 at the north edge of the bounds (XYZ, not TMS, ordering).
+    - name: bounds
+      type: geometry
+      description: Optional extent of the whole tile pyramid. Defaults to the Web Mercator world in SRID 3857.
+      optional: true
+    - name: margin
+      type: float
+      description: Optional expansion as a fraction of tile size, e.g. 0.0625 for a 64/1024 buffer. PostGIS 3.1+.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_SRID(ST_TileEnvelope(0, 0, 0)) AS srid,
+             ROUND(ST_XMin(ST_TileEnvelope(0, 0, 0))::numeric, 4) AS world_xmin;
+    result: |2-
+       srid |   world_xmin
+      ------+----------------
+       3857 | -20037508.3428
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              WITH bounds AS (SELECT ST_TileEnvelope(%s, %s, %s) AS geom),
+              mvt AS (SELECT ST_AsMVTGeom(r.geom, b.geom) AS geom, r.name
+                      FROM roads r, bounds b WHERE r.geom && b.geom)
+              SELECT ST_AsMVT(mvt, 'roads') FROM mvt
+              """,
+              (z, x, y),
+          )
+          (tile,) = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_TileEnvelope
+
+      env = ST_TileEnvelope(z, x, y).label("env")
+      stmt = select(Road.id, Road.name).where(Road.geom.intersects(env))
+  srid_notes: >-
+    With the default bounds the result is SRID 3857, so your geometry column must also be
+    3857 for the && to work and for the index to be used. If your table is stored in 4326,
+    transform the envelope down to 4326 rather than transforming the column up - or pass
+    ST_MakeEnvelope(-180, -90, 180, 90, 4326) as the bounds argument and get a tile grid in
+    degrees, which is a different (plate carree) tiling scheme, not reprojected Web Mercator.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Constructor, but a stable one: computed once per query it becomes a constant, so
+      geom && ST_TileEnvelope(z, x, y) is fully index-assisted. This is the standard
+      shape of an indexed tile query.
+  common_mistakes:
+    - "Using it against a 4326 column and getting a mixed-SRID error, or worse, transforming the column and losing the index."
+    - "Confusing XYZ and TMS row ordering - ST_TileEnvelope uses XYZ, where y increases southward."
+    - "Passing a margin on PostGIS 3.0, where the five-argument form does not exist."
+  see_also:
+    - ST_AsMVT
+    - ST_AsMVTGeom
+    - ST_MakeEnvelope
+    - "&&"
+    - ST_Transform
+  tags: [tiles, mvt, envelope, web-mercator, constructor]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/

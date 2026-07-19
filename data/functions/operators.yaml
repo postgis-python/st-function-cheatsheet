@@ -1,0 +1,379 @@
+# Bounding-box and KNN operators. These are what the GiST index actually understands;
+# every indexable ST_* predicate is rewritten by PostGIS into one of these internally.
+
+- name: "&&"
+  category: operators
+  signatures:
+    - "geometry && geometry -> boolean"
+    - "geography && geography -> boolean"
+  summary: >-
+    Returns true when the 2D bounding boxes of the two arguments intersect. This is the
+    raw index operator: it compares cached boxes, never the actual vertices, so it is
+    cheap but approximate. Every GiST-accelerated predicate in PostGIS is internally a
+    && test followed by an exact recheck, which is why && on its own is the fastest
+    possible spatial filter and also the least precise one.
+  returns: boolean
+  since: "1.0 (geography since 1.5)"
+  arguments:
+    - name: A
+      type: geometry
+      description: Left operand; its cached 2D bounding box is used.
+    - name: B
+      type: geometry
+      description: Right operand; its cached 2D bounding box is used.
+  example:
+    sql: |-
+      SELECT 'LINESTRING(0 0, 10 10)'::geometry && 'POINT(9 1)'::geometry AS bbox_hit,
+             ST_Intersects('LINESTRING(0 0, 10 10)'::geometry, 'POINT(9 1)'::geometry) AS real_hit;
+    result: |2-
+       bbox_hit | real_hit
+      ----------+----------
+       t        | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT id FROM parcels WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 3857)",
+              (xmin, ymin, xmax, ymax),
+          )
+          candidate_ids = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_MakeEnvelope
+
+      box = ST_MakeEnvelope(xmin, ymin, xmax, ymax, 3857)
+      stmt = select(Parcel.id).where(Parcel.geom.bool_op("&&")(box))
+  srid_notes: >-
+    Both operands must share an SRID or PostGIS raises "Operation on mixed SRID
+    geometries". The comparison is always planar and always in the units of that SRID,
+    so on 4326 a box is degrees, not metres. Boxes of geographic data that cross the
+    antimeridian wrap badly - split such geometries before indexing.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      This is the index operator itself. A GiST index on the left column is used
+      directly whenever the right operand is a constant or a parameter.
+  common_mistakes:
+    - "Treating && as a real intersection test. It only compares rectangles, so a diagonal line 'intersects' every point in its bounding box."
+    - "Mixing SRIDs between the operands, which errors out rather than silently reprojecting."
+    - "Adding && alongside ST_Intersects in the same WHERE clause. ST_Intersects already emits the && term itself, so the extra predicate only costs planning time."
+  see_also:
+    - ST_Intersects
+    - ST_DWithin
+    - ST_Expand
+    - "&&&"
+    - ST_MakeEnvelope
+  tags: [bbox, index, operator, gist, filter]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: "<->"
+  category: operators
+  signatures:
+    - "geometry <-> geometry -> double precision"
+    - "geography <-> geography -> double precision"
+  summary: >-
+    The KNN distance operator. In an ORDER BY it lets a GiST index return rows in
+    order of increasing distance from a reference point, which is the only way to get
+    a nearest-neighbour query that does not read the whole table. Since PostGIS 2.2 on
+    PostgreSQL 9.5+ it returns true geometry-to-geometry distance, not box distance.
+  returns: double precision
+  since: "2.0 (true distance since 2.2)"
+  arguments:
+    - name: A
+      type: geometry
+      description: Left operand. For index use, this must be the indexed column.
+    - name: B
+      type: geometry
+      description: Right operand, normally a constant reference geometry.
+  example:
+    sql: |-
+      SELECT ROUND(('POINT(0 0)'::geometry <-> 'POINT(3 4)'::geometry)::numeric, 3) AS d;
+    result: |2-
+         d
+      -------
+       5.000
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, name, geom <-> ST_SetSRID(ST_MakePoint(%s, %s), 4326) AS dist
+              FROM stops
+              ORDER BY geom <-> ST_SetSRID(ST_MakePoint(%s, %s), 4326)
+              LIMIT 10
+              """,
+              (lon, lat, lon, lat),
+          )
+          nearest = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_MakePoint, ST_SetSRID
+
+      here = ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+      stmt = select(Stop.id, Stop.name).order_by(Stop.geom.distance_centroid(here)).limit(10)
+  srid_notes: >-
+    On geometry the result is in SRID units, so on 4326 you get degrees - useless as a
+    distance but perfectly valid as an ordering key at small extents. For metres either
+    cast both sides to geography (the geography <-> is also index-assisted) or store a
+    projected column. Ordering by degrees and ordering by metres differ noticeably at
+    high latitudes.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Index-assisted only in an ORDER BY with a LIMIT, where one side is a constant and
+      the other is the indexed column. Put it in a WHERE clause and you get a sequential
+      scan; use ST_DWithin there instead.
+  common_mistakes:
+    - "Using <-> in WHERE (geom <-> point < 1000). That is not index-assisted - use ST_DWithin for a radius filter."
+    - "Omitting LIMIT, which makes the planner prefer a sort over the index scan and reads every row."
+    - "Reading the geometry result as metres on SRID 4326, where it is degrees."
+  see_also:
+    - "<#>"
+    - ST_DWithin
+    - ST_Distance
+    - ST_ClosestPoint
+  tags: [knn, nearest-neighbour, distance, order-by, index, operator]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: "<#>"
+  category: operators
+  signatures:
+    - "geometry <#> geometry -> double precision"
+  summary: >-
+    Returns the distance between the bounding boxes of two geometries, and like <-> it
+    can drive an index-assisted ORDER BY. Because it compares boxes it is cheaper than
+    <-> but only approximate; it returns 0 for any pair whose boxes overlap, so it
+    cannot rank objects that are box-wise nested.
+  returns: double precision
+  since: "2.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: Left operand; only its bounding box is considered.
+    - name: B
+      type: geometry
+      description: Right operand; only its bounding box is considered.
+  example:
+    sql: |-
+      SELECT 'LINESTRING(0 0, 1 1)'::geometry <#> 'POINT(4 0)'::geometry AS box_dist,
+             ST_Distance('LINESTRING(0 0, 1 1)'::geometry, 'POINT(4 0)'::geometry) AS true_dist;
+    result: |2-
+       box_dist |     true_dist
+      ----------+--------------------
+              3 | 3.1622776601683795
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id FROM tiles
+              ORDER BY bbox <#> ST_SetSRID(ST_MakePoint(%s, %s), 3857)
+              LIMIT 50
+              """,
+              (x, y),
+          )
+          coarse_candidates = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_MakePoint, ST_SetSRID
+
+      here = ST_SetSRID(ST_MakePoint(x, y), 3857)
+      stmt = select(Tile.id).order_by(Tile.bbox.distance_box(here)).limit(50)
+  srid_notes: >-
+    Planar and in SRID units, exactly like &&. There is no geography form of <#>. If
+    your data is in 4326 the box distance is in degrees and is anisotropic away from
+    the equator, which makes it a poor ranking key over large latitude ranges.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Index-assisted in ORDER BY with LIMIT, same conditions as <->. Useful as a cheap
+      first pass over large polygons, then re-rank the shortlist with ST_Distance.
+  common_mistakes:
+    - "Expecting true distance. Two long overlapping-box geometries both score 0 and become unorderable."
+    - "Using it on point data, where it is identical to <-> but less obvious to the next reader."
+    - "Assuming a geography variant exists; it does not."
+  see_also:
+    - "<->"
+    - "&&"
+    - ST_Distance
+  tags: [knn, bbox, distance, order-by, index, operator]
+
+- name: "&&&"
+  category: operators
+  signatures:
+    - "geometry &&& geometry -> boolean"
+  summary: >-
+    The n-dimensional counterpart of &&: it returns true when the n-D bounding boxes of
+    the two geometries intersect, taking Z (and M, for the ND index) into account. You
+    need it when a 2D box test would wrongly match features that are separated only in
+    elevation, such as building floors or seismic horizons.
+  returns: boolean
+  since: "2.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: Left operand; its n-D bounding box is used.
+    - name: B
+      type: geometry
+      description: Right operand; its n-D bounding box is used.
+  example:
+    sql: |-
+      SELECT 'LINESTRING Z (0 0 0, 1 1 1)'::geometry &&& 'LINESTRING Z (0 0 5, 1 1 6)'::geometry AS nd_hit,
+             'LINESTRING Z (0 0 0, 1 1 1)'::geometry &&  'LINESTRING Z (0 0 5, 1 1 6)'::geometry AS twod_hit;
+    result: |2-
+       nd_hit | twod_hit
+      --------+----------
+       f      | t
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT id FROM boreholes WHERE geom &&& ST_3DMakeBox(%s::geometry, %s::geometry)",
+              (lower_corner_ewkt, upper_corner_ewkt),
+          )
+          hits = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+
+      stmt = select(Borehole.id).where(Borehole.geom.bool_op("&&&")(volume_geom))
+  srid_notes: >-
+    Same mixed-SRID rule as &&. Z values are in whatever unit the source data used and
+    are never converted by ST_Transform, which only touches X/Y for most projections -
+    so a table in metres horizontally may still hold feet vertically. Check before
+    trusting a Z comparison.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Requires an n-D index built with the ND operator class:
+      CREATE INDEX ... USING gist (geom gist_geometry_ops_nd). The default 2D GiST index
+      will not serve &&&.
+  common_mistakes:
+    - "Expecting the default GiST index to serve it; you must create a gist_geometry_ops_nd index."
+    - "Using &&& on 2D data, where it degenerates to && with extra confusion."
+    - "Assuming ST_Transform reprojects Z, so comparing Z values across differently projected tables."
+  see_also:
+    - "&&"
+    - ST_Force2D
+  tags: [bbox, 3d, index, operator, nd]
+  docs_url: https://www.postgis-python.com/advanced-gist-indexing-optimization/
+
+- name: "~"
+  category: operators
+  signatures:
+    - "geometry ~ geometry -> boolean"
+  summary: >-
+    Returns true when the bounding box of A completely contains the bounding box of B.
+    It is the box-level analogue of ST_Contains and is occasionally useful as a
+    hand-written prefilter for containment queries against very complex polygons, where
+    the exact test is expensive.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: Candidate container; its bounding box must enclose B's.
+    - name: B
+      type: geometry
+      description: Candidate contained geometry.
+  example:
+    sql: |-
+      SELECT 'POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry ~ 'POINT(5 5)'::geometry AS box_contains;
+    result: |2-
+       box_contains
+      --------------
+       t
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT id FROM regions WHERE geom ~ %s::geometry ORDER BY ST_Area(geom) LIMIT 1",
+              (point_ewkt,),
+          )
+          smallest_enclosing = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+
+      stmt = select(Region.id).where(Region.geom.bool_op("~")(point_element))
+  srid_notes: >-
+    Planar box comparison in SRID units, with the usual mixed-SRID error. Note that
+    box containment is not geometry containment: a concave polygon's box contains
+    points that lie outside the polygon itself.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Directly index-assisted on the left operand. ST_Contains already generates this
+      internally, so writing it yourself is only worthwhile in hand-tuned two-stage
+      queries.
+  common_mistakes:
+    - "Reading it as real containment. A crescent-shaped polygon's box contains the hole."
+    - "Confusing it with the PostgreSQL regex-match operator of the same spelling on text."
+    - "Getting the operand order backwards; ~ means 'A's box contains B's box', @ is the reverse."
+  see_also:
+    - "@"
+    - ST_Contains
+    - "&&"
+  tags: [bbox, contains, index, operator]
+
+- name: "@"
+  category: operators
+  signatures:
+    - "geometry @ geometry -> boolean"
+  summary: >-
+    Returns true when the bounding box of A is completely contained by the bounding box
+    of B. It is exactly the ~ operator with the operands reversed, provided so that the
+    indexed column can stay on the left in either direction of a containment query.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: Candidate contained geometry; its box must fall inside B's.
+    - name: B
+      type: geometry
+      description: Candidate container.
+  example:
+    sql: |-
+      SELECT 'POINT(5 5)'::geometry @ 'POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry AS inside_box;
+    result: |2-
+       inside_box
+      ------------
+       t
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT count(*) FROM trees WHERE geom @ ST_MakeEnvelope(%s, %s, %s, %s, 27700)",
+              (xmin, ymin, xmax, ymax),
+          )
+          (count,) = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import func, select
+      from geoalchemy2.functions import ST_MakeEnvelope
+
+      box = ST_MakeEnvelope(xmin, ymin, xmax, ymax, 27700)
+      stmt = select(func.count()).select_from(Tree).where(Tree.geom.bool_op("@")(box))
+  srid_notes: >-
+    Planar, SRID units, mixed SRIDs error. For a viewport query the envelope you build
+    must be in the same SRID as the column - build it with ST_MakeEnvelope(..., srid)
+    rather than transforming the column, which would defeat the index.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Index-assisted on the left operand, which makes it the natural spelling for
+      "features inside this viewport" against an indexed geometry column.
+  common_mistakes:
+    - "Swapping the operands, which silently returns the wrong rows rather than erroring."
+    - "Wrapping the indexed column in ST_Transform to match the envelope's SRID, which makes the index unusable."
+    - "Expecting exact containment; only the boxes are compared."
+  see_also:
+    - "~"
+    - ST_Within
+    - ST_MakeEnvelope
+  tags: [bbox, within, viewport, index, operator]
+  docs_url: https://www.postgis-python.com/advanced-gist-indexing-optimization/

@@ -1,0 +1,653 @@
+# Serialisation functions: turning geometry back into text, binary, JSON, vector tiles or
+# SVG. These are the boundary between the database and everything downstream of it.
+
+- name: ST_AsText
+  category: output
+  signatures:
+    - "ST_AsText(geometry geom) -> text"
+    - "ST_AsText(geometry geom, integer maxdecimaldigits) -> text"
+    - "ST_AsText(geography geog) -> text"
+    - "ST_AsText(geography geog, integer maxdecimaldigits = 15) -> text"
+  summary: >-
+    Renders a geometry as OGC Well-Known Text, the canonical human-readable form of a
+    geometry. It is the function you reach for when debugging, when writing test
+    fixtures, or when handing a shape to a tool that speaks WKT but not PostGIS binary.
+    The one thing it does not carry is the SRID: ST_AsText of a point in 4326 and the
+    same point in 27700 produce identical strings, so WKT alone is not a lossless
+    round trip. Keep it out of hot query paths - serialising large polygons to text is
+    far more expensive than shipping the binary form the driver already understands.
+  returns: text
+  since: "1.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The geometry (or geography) to serialise.
+    - name: maxdecimaldigits
+      type: integer
+      description: Maximum digits after the decimal point in coordinate output. Optional precision parameter introduced in PostGIS 2.5.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_SetSRID(ST_MakePoint(1, 2), 4326)) AS wkt;
+    result: |2-
+          wkt
+      ------------
+       POINT(1 2)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT id, ST_AsText(geom) FROM survey_marks WHERE id = %s",
+              (mark_id,),
+          )
+          mark_id, wkt = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsText
+
+      stmt = select(SurveyMark.id, ST_AsText(SurveyMark.geom)).where(
+          SurveyMark.id == mark_id
+      )
+  srid_notes: >-
+    ST_AsText silently discards the SRID, so the output of a 4326 geometry is
+    indistinguishable from the output of an unprojected one. If the consumer needs the
+    CRS, use ST_AsEWKT or carry ST_SRID(geom) as a second column. Coordinate order in
+    the WKT is always X then Y - on 4326 that means longitude first, which is the
+    reverse of the lat/lon ordering most APIs and humans use.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Purely an output function; it never participates in index selection. Comparing
+      ST_AsText(geom) = 'POINT(1 2)' in a WHERE clause forces a sequential scan and a
+      text serialisation of every row - compare geometries with ST_Equals instead.
+  common_mistakes:
+    - "Assuming the SRID survives. It does not; reading the WKT back with ST_GeomFromText yields SRID 0 unless you pass the SRID explicitly."
+    - "Using it as an equality key (WHERE ST_AsText(a) = ST_AsText(b)), which is both unindexable and wrong for geometries that differ only in vertex order or precision."
+    - "Selecting ST_AsText over a whole table to move data to Python, when the driver can read the native binary far faster."
+  see_also:
+    - ST_AsEWKT
+    - ST_AsBinary
+    - ST_GeomFromText
+    - ST_SRID
+  tags: [wkt, serialisation, text, debugging]
+
+- name: ST_AsEWKT
+  category: output
+  signatures:
+    - "ST_AsEWKT(geometry geom) -> text"
+    - "ST_AsEWKT(geometry geom, integer maxdecimaldigits) -> text"
+    - "ST_AsEWKT(geography geog) -> text"
+    - "ST_AsEWKT(geography geog, integer maxdecimaldigits = 15) -> text"
+  summary: >-
+    Produces PostGIS's Extended Well-Known Text: the same WKT body, prefixed with the
+    SRID and able to express Z and M coordinates that plain WKT variants often lose in
+    transit. Use it whenever a geometry has to survive a round trip through a text
+    channel - a CSV export, a migration script, a bug report - because ST_GeomFromEWKT
+    reads it straight back with the CRS intact. It is a PostGIS extension rather than an
+    OGC standard, so tools outside the PostGIS ecosystem may not parse the SRID prefix.
+  returns: text
+  since: "1.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The geometry (or geography) to serialise, including its SRID and any Z/M ordinates.
+    - name: maxdecimaldigits
+      type: integer
+      description: Maximum digits after the decimal point in coordinate output. Added in PostGIS 3.1.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsEWKT(ST_SetSRID(ST_MakePoint(1, 2), 4326)) AS ewkt;
+    result: |2-
+              ewkt
+      ---------------------
+       SRID=4326;POINT(1 2)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT ST_AsEWKT(geom) FROM pipeline_segments WHERE segment_id = %s",
+              (segment_id,),
+          )
+          (ewkt,) = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsEWKT
+
+      stmt = select(ST_AsEWKT(PipelineSegment.geom)).where(
+          PipelineSegment.segment_id == segment_id
+      )
+  srid_notes: >-
+    This is the text format that keeps the SRID, emitted as a "SRID=4326;" prefix ahead
+    of the geometry body. A geometry with SRID 0 produces no prefix at all, so an
+    unexpectedly bare output is a reliable sign the column was never ST_SetSRID'd.
+    ST_AsEWKT does not reproject - it reports whatever SRID the geometry carries, which
+    may be a lie if someone set the SRID instead of transforming.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Output only, never index-assisted. On wide tables it is worth selecting EWKT for a
+      handful of inspected rows rather than an entire result set, since the text form is
+      typically two to three times larger than the binary.
+  common_mistakes:
+    - "Feeding EWKT to a strict OGC WKT parser, which chokes on the SRID= prefix; strip it or use ST_AsText for those consumers."
+    - "Reading a missing SRID= prefix as a bug in ST_AsEWKT rather than as SRID 0 on the stored geometry."
+    - "Assuming the prefix means the coordinates were reprojected. It only records the declared SRID."
+  see_also:
+    - ST_AsText
+    - ST_GeomFromEWKT
+    - ST_SetSRID
+    - ST_SRID
+  tags: [ewkt, serialisation, text, srid]
+
+- name: ST_AsBinary
+  category: output
+  signatures:
+    - "ST_AsBinary(geometry geom) -> bytea"
+    - "ST_AsBinary(geometry geom, text NDR_or_XDR) -> bytea"
+    - "ST_AsBinary(geography geog) -> bytea"
+    - "ST_AsBinary(geography geog, text NDR_or_XDR) -> bytea"
+  summary: >-
+    Emits the OGC Well-Known Binary representation of a geometry. WKB is the interchange
+    format that most GIS libraries - Shapely, GDAL/OGR, GeoPandas, JTS - read natively,
+    so it is the right choice when you are moving geometry into another process rather
+    than showing it to a person. It is compact and exact, with no decimal rounding, and
+    parsing it is far cheaper than parsing WKT. Like ST_AsText it drops the SRID; the
+    EWKB form that PostGIS uses on the wire by default keeps it, which is why
+    GeoAlchemy2's WKBElement usually still knows the CRS.
+  returns: bytea
+  since: "1.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The geometry (or geography) to serialise.
+    - name: NDR_or_XDR
+      type: text
+      description: "Byte order of the output: 'NDR' for little-endian, 'XDR' for big-endian. Defaults to the server's native order."
+      optional: true
+  example:
+    sql: |-
+      SELECT encode(ST_AsBinary('POINT(1 2)'::geometry, 'NDR'), 'hex') AS wkb_hex;
+    result: |2-
+                            wkb_hex
+      --------------------------------------------------
+       0101000000000000000000f03f0000000000000040
+    psycopg: |-
+      from shapely import wkb
+
+      with conn.cursor() as cur:
+          cur.execute("SELECT ST_AsBinary(geom) FROM buildings WHERE gid = %s", (gid,))
+          (raw,) = cur.fetchone()
+      shape = wkb.loads(bytes(raw))
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsBinary
+
+      stmt = select(Building.gid, ST_AsBinary(Building.geom)).where(
+          Building.gid == gid
+      )
+  srid_notes: >-
+    Plain WKB has no place to record a CRS, so the SRID is lost and the receiving
+    library will treat the coordinates as unitless numbers. If the consumer needs the
+    CRS, either select ST_SRID(geom) alongside it or let the driver return the native
+    EWKB (a bare `SELECT geom`), which encodes the SRID in a high bit of the type word.
+    Nothing here reprojects, so a 4326 geometry arrives in degrees.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Output only. Worth preferring over ST_AsText for bulk extraction: the binary form
+      avoids the float-to-string conversion that dominates the cost of serialising
+      vertex-heavy polygons.
+  common_mistakes:
+    - "Expecting the SRID to be present; use the raw column (EWKB) or a separate ST_SRID column if it matters."
+    - "Hard-coding a byte order assumption in the consumer instead of letting the WKB header's first byte declare it."
+    - "Round-tripping through ST_AsText for library interop when the library already reads WKB, paying a large and unnecessary parsing cost."
+  see_also:
+    - ST_AsText
+    - ST_AsEWKT
+    - ST_GeomFromWKB
+    - ST_SRID
+  tags: [wkb, binary, serialisation, interop]
+
+- name: ST_AsGeoJSON
+  category: output
+  signatures:
+    - "ST_AsGeoJSON(geometry geom, integer maxdecimaldigits = 9, integer options = 8) -> text"
+    - "ST_AsGeoJSON(geography geog, integer maxdecimaldigits = 9, integer options = 0) -> text"
+    - "ST_AsGeoJSON(record feature, text geom_column = '', integer maxdecimaldigits = 9, boolean pretty_bool = false, text id_column = '') -> text"
+  summary: >-
+    Serialises a geometry as a GeoJSON geometry object, and since PostGIS 3.0 can take a
+    whole row and emit a complete GeoJSON Feature with the non-geometry columns folded
+    into properties. It is the workhorse for feeding web maps, Leaflet and MapLibre
+    layers, and any HTTP API that returns spatial data. The output is a fragment, not a
+    FeatureCollection - you assemble that yourself with json_agg or json_build_object.
+    The critical constraint is the CRS: GeoJSON is defined on WGS84 longitude/latitude,
+    so anything not already in 4326 must be transformed before it is serialised.
+  returns: text
+  since: "1.3.4"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The geometry (or geography) to serialise. Must already be in lon/lat for spec-compliant output.
+    - name: maxdecimaldigits
+      type: integer
+      description: Maximum digits after the decimal point; defaults to 9. Lowering it to 6 or 7 shrinks tiles and payloads noticeably.
+      optional: true
+    - name: options
+      type: integer
+      description: Bitmask controlling CRS and bbox output; 0 = none, 1 = include bbox, 2 = short CRS, 4 = long CRS. Defaults to 8 for the geometry form and 0 for the geography form.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsGeoJSON(ST_SetSRID(ST_MakePoint(1, 2), 4326)) AS geojson;
+    result: |2-
+                    geojson
+      -------------------------------------
+       {"type":"Point","coordinates":[1,2]}
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT json_build_object(
+                       'type', 'FeatureCollection',
+                       'features', json_agg(ST_AsGeoJSON(t.*)::json)
+                     )
+              FROM (SELECT id, name, ST_Transform(geom, 4326) AS geom
+                    FROM districts WHERE region_id = %s) AS t
+              """,
+              (region_id,),
+          )
+          (feature_collection,) = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsGeoJSON, ST_Transform
+
+      stmt = select(ST_AsGeoJSON(ST_Transform(District.geom, 4326), 6)).where(
+          District.region_id == region_id
+      )
+  srid_notes: >-
+    RFC 7946 mandates WGS84 longitude/latitude, and PostGIS will happily serialise a
+    projected geometry without complaint - a British National Grid polygon comes out as
+    coordinates in the hundreds of thousands and lands off the coast of Africa when a
+    web map renders it. Always wrap the column in ST_Transform(geom, 4326) first. Note
+    ST_Transform in the SELECT list does not defeat the index as long as your WHERE
+    clause filters on the untransformed column. Coordinate order is [longitude,
+    latitude], not [latitude, longitude].
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Output only. In tile and viewport endpoints, filter with an indexed && or
+      ST_Intersects against the envelope first and serialise only the surviving rows;
+      calling ST_AsGeoJSON before the filter serialises the whole table.
+  common_mistakes:
+    - "Serialising a projected geometry without ST_Transform(geom, 4326), producing valid JSON that plots nowhere near the intended location."
+    - "Returning bare geometry objects where the client expects a FeatureCollection, instead of using the row form or json_agg."
+    - "Leaving maxdecimaldigits at the default 9 for web payloads, where 6 digits is already sub-metre precision and the extra digits are pure bandwidth."
+  see_also:
+    - ST_GeomFromGeoJSON
+    - ST_Transform
+    - ST_AsMVT
+    - ST_AsText
+  tags: [geojson, serialisation, web, api, json]
+  docs_url: https://www.postgis-python.com/sqlalchemy-and-geoalchemy-integration-workflows/
+
+- name: ST_AsMVT
+  category: output
+  signatures:
+    - "ST_AsMVT(anyelement row) -> bytea"
+    - "ST_AsMVT(anyelement row, text name) -> bytea"
+    - "ST_AsMVT(anyelement row, text name, integer extent) -> bytea"
+    - "ST_AsMVT(anyelement row, text name, integer extent, text geom_name) -> bytea"
+    - "ST_AsMVT(anyelement row, text name, integer extent, text geom_name, text feature_id_name) -> bytea"
+  summary: >-
+    An aggregate function that collects rows into a single Mapbox Vector Tile protobuf.
+    Each input row contributes one feature: the geometry column becomes the feature
+    geometry and every other column becomes a tag, which is why you pass the whole row
+    (t.*) rather than a geometry. It is the standard way to serve dynamic vector tiles
+    straight from PostGIS with no tile server in between. Because it is an aggregate it
+    always needs a GROUP BY or a subquery boundary, and because it expects tile-space
+    coordinates each row's geometry must have gone through ST_AsMVTGeom first.
+  returns: bytea
+  since: "2.4"
+  arguments:
+    - name: row
+      type: anyelement
+      description: A whole-row reference (typically t.*) whose geometry column becomes the feature and whose other columns become tags.
+    - name: name
+      type: text
+      description: Layer name written into the tile. Defaults to the string "default".
+      optional: true
+    - name: extent
+      type: integer
+      description: Tile extent in tile-space units; defaults to 4096 and must match the extent used in ST_AsMVTGeom.
+      optional: true
+    - name: geom_name
+      type: text
+      description: Name of the column holding the geometry. Defaults to the first geometry column found.
+      optional: true
+    - name: feature_id_name
+      type: text
+      description: Name of the column to use as the feature id. Must be an integer column; if unset, no feature ids are written.
+      optional: true
+  example:
+    sql: |-
+      WITH f AS (
+        SELECT 1 AS id,
+               ST_AsMVTGeom(
+                 'POINT(0 0)'::geometry,
+                 ST_MakeBox2D(ST_Point(-1, -1), ST_Point(1, 1))
+               ) AS geom
+      )
+      SELECT length(ST_AsMVT(f.*, 'points')) > 0 AS produced_tile FROM f;
+    result: |2-
+       produced_tile
+      ---------------
+       t
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              WITH bounds AS (SELECT ST_TileEnvelope(%s, %s, %s) AS env),
+              mvt AS (
+                SELECT p.id, p.name,
+                       ST_AsMVTGeom(p.geom, bounds.env) AS geom
+                FROM parcels p, bounds
+                WHERE p.geom && bounds.env
+              )
+              SELECT ST_AsMVT(mvt.*, 'parcels', 4096, 'geom', 'id') FROM mvt
+              """,
+              (z, x, y),
+          )
+          (tile,) = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsMVT, ST_AsMVTGeom, ST_TileEnvelope
+
+      env = ST_TileEnvelope(z, x, y)
+      mvt = select(
+          Parcel.id, Parcel.name, ST_AsMVTGeom(Parcel.geom, env).label("geom")
+      ).where(Parcel.geom.intersects(env)).cte("mvt")
+      stmt = select(ST_AsMVT(mvt.table_valued(), "parcels", 4096, "geom", "id"))
+  srid_notes: >-
+    ST_AsMVT itself does no CRS work at all - it assumes the geometries handed to it are
+    already integer tile coordinates produced by ST_AsMVTGeom. The tile pyramid the MVT
+    spec describes is Web Mercator (EPSG:3857), so the bounds you pass to ST_AsMVTGeom
+    must be a 3857 envelope, normally from ST_TileEnvelope(z, x, y). If your table is
+    stored in 4326 you must ST_Transform to 3857 before clipping, or build the envelope
+    in 4326 and accept that the resulting tile will not align with any standard tile
+    grid.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      The aggregate cannot use an index, so all of the performance comes from the inner
+      query: filter with geom && ST_TileEnvelope(z, x, y) against a GiST index on the
+      geometry column in the tile's SRID so only candidate rows are ever clipped.
+  common_mistakes:
+    - "Passing a bare geometry instead of a whole-row reference (t.*), which loses every attribute or fails outright."
+    - "Feeding it raw table geometries without ST_AsMVTGeom, producing a tile whose coordinates are far outside the 0-4096 tile space and renders as empty."
+    - "Using a different extent in ST_AsMVT than in ST_AsMVTGeom, which scales all the geometry wrongly."
+    - "Forgetting the bbox prefilter, so every row in the table is clipped for every tile request."
+  see_also:
+    - ST_AsMVTGeom
+    - ST_TileEnvelope
+    - ST_Transform
+    - ST_AsGeoJSON
+  tags: [mvt, vector-tiles, aggregate, web, protobuf]
+
+- name: ST_AsMVTGeom
+  category: output
+  signatures:
+    - "ST_AsMVTGeom(geometry geom, box2d bounds) -> geometry"
+    - "ST_AsMVTGeom(geometry geom, box2d bounds, integer extent, integer buffer, boolean clip_geom) -> geometry"
+  summary: >-
+    Prepares a single geometry for inclusion in a vector tile: it clips the shape to the
+    tile bounds plus a buffer, translates and scales it into the tile's integer
+    coordinate space, and snaps the vertices to that grid. This is the per-row half of
+    the vector tile pipeline that ST_AsMVT aggregates. It can return NULL - for
+    geometries that fall entirely outside the bounds, or that collapse to nothing once
+    snapped to the grid at low zoom - so downstream queries should filter those out
+    rather than assume every row yields a feature.
+  returns: geometry
+  since: "2.4"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The source geometry, which must already be in the same SRID as bounds.
+    - name: bounds
+      type: box2d
+      description: The tile extent in the source SRID, typically ST_TileEnvelope(z, x, y)::box2d.
+    - name: extent
+      type: integer
+      description: Width of the tile in tile coordinate space; defaults to 4096.
+      optional: true
+    - name: buffer
+      type: integer
+      description: Number of tile-space units of geometry to keep outside the tile edge, so labels and strokes do not clip at seams. Defaults to 256.
+      optional: true
+    - name: clip_geom
+      type: boolean
+      description: Whether to clip geometry to the buffered bounds. Defaults to true; set false to keep whole features at the cost of tile size.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(
+               ST_AsMVTGeom(
+                 'POINT(0 0)'::geometry,
+                 ST_MakeBox2D(ST_Point(-1, -1), ST_Point(1, 1)),
+                 4096, 0, true
+               )
+             ) AS tile_coords;
+    result: |2-
+         tile_coords
+      -------------------
+       POINT(2048 2048)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT road_id,
+                     ST_AsMVTGeom(geom, ST_TileEnvelope(%s, %s, %s), 4096, 64, true) AS g
+              FROM roads
+              WHERE geom && ST_TileEnvelope(%s, %s, %s)
+              """,
+              (z, x, y, z, x, y),
+          )
+          clipped = [row for row in cur if row[1] is not None]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsMVTGeom, ST_TileEnvelope
+
+      env = ST_TileEnvelope(z, x, y)
+      stmt = select(
+          Road.road_id, ST_AsMVTGeom(Road.geom, env, 4096, 64, True).label("g")
+      ).where(Road.geom.intersects(env))
+  srid_notes: >-
+    The geometry and the bounds must share an SRID; there is no implicit reprojection,
+    and a mismatch either errors or produces silently empty tiles. Standard XYZ tiles
+    are Web Mercator, so the usual shape is ST_AsMVTGeom(ST_Transform(geom, 3857),
+    ST_TileEnvelope(z, x, y)). Transforming inside the SELECT is fine, but transform the
+    envelope rather than the column in the WHERE clause so the GiST index stays usable.
+    The output geometry carries tile coordinates with the Y axis pointing down, which is
+    why it is meaningless outside a tile.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      A per-row computation with no index involvement of its own. It is expensive enough
+      on complex polygons that the && prefilter against the tile envelope is what makes
+      or breaks tile latency; a GiST index on the geometry column in the tile SRID is
+      effectively mandatory.
+  common_mistakes:
+    - "Not filtering NULL results, then passing rows with NULL geometry into ST_AsMVT."
+    - "Passing bounds in a different SRID from the geometry, which yields an empty or nonsensical tile with no error."
+    - "Setting buffer to 0 and then wondering why line strokes and labels are cut off at tile boundaries."
+    - "Simplifying after ST_AsMVTGeom rather than before; the grid snapping already generalises, and simplifying in tile space distorts shapes."
+  see_also:
+    - ST_AsMVT
+    - ST_TileEnvelope
+    - ST_Transform
+    - ST_Simplify
+  tags: [mvt, vector-tiles, clipping, tiles, web]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: ST_AsSVG
+  category: output
+  signatures:
+    - "ST_AsSVG(geometry geom) -> text"
+    - "ST_AsSVG(geometry geom, integer rel, integer maxdecimaldigits) -> text"
+    - "ST_AsSVG(geography geog, integer rel, integer maxdecimaldigits) -> text"
+  summary: >-
+    Emits the path data of an SVG element for a geometry: a "d" attribute body for lines
+    and polygons, or cx/cy attribute text for points. It is a niche but genuinely useful
+    function for generating static maps, print output or small inline diagrams directly
+    from SQL without a rendering library. What it gives you is a fragment, not a
+    document - you supply the surrounding svg element, viewBox and styling. Because SVG
+    has no notion of a coordinate system, the geometry must already be in whatever
+    projected space you intend to draw in.
+  returns: text
+  since: "1.2.2"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The geometry to render as SVG path data.
+    - name: rel
+      type: integer
+      description: 0 for absolute path commands (the default), 1 for relative ones.
+      optional: true
+    - name: maxdecimaldigits
+      type: integer
+      description: Maximum digits after the decimal point; defaults to 15.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsSVG('POINT(1 2)'::geometry) AS svg;
+    result: |2-
+             svg
+      -----------------
+       cx="1" cy="-2"
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              "SELECT ST_AsSVG(ST_Transform(geom, 3857), 0, 2) FROM catchments WHERE id = %s",
+              (catchment_id,),
+          )
+          (path_data,) = cur.fetchone()
+      svg_element = f'<path d="{path_data}" />'
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsSVG, ST_Transform
+
+      stmt = select(ST_AsSVG(ST_Transform(Catchment.geom, 3857), 0, 2)).where(
+          Catchment.id == catchment_id
+      )
+  srid_notes: >-
+    ST_AsSVG neither reads nor reprojects the SRID; it writes the raw coordinates out.
+    Rendering 4326 degrees directly gives you an unprojected plate carree map that looks
+    increasingly stretched away from the equator, so transform to a projected CRS such
+    as 3857 or a local grid first. Note that SVG's Y axis points down while geographic Y
+    points up, which is why the function negates Y - hence cy="-2" for a point at Y=2.
+    Your viewBox must account for those negative Y values.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Output only, no index involvement. Simplify with ST_SimplifyPreserveTopology
+      before rendering: the SVG path string for an unsimplified coastline can be
+      megabytes of text that no browser will draw smoothly.
+  common_mistakes:
+    - "Forgetting that Y is negated, then setting a viewBox with positive Y and rendering a blank image."
+    - "Rendering 4326 coordinates straight to SVG and getting a distorted, unprojected map."
+    - "Leaving maxdecimaldigits at the default 15, producing enormous path strings where 1-2 digits of a projected coordinate is already sub-pixel."
+  see_also:
+    - ST_Transform
+    - ST_SimplifyPreserveTopology
+    - ST_AsGeoJSON
+  tags: [svg, rendering, serialisation, cartography]
+
+- name: ST_GeoHash
+  category: output
+  signatures:
+    - "ST_GeoHash(geometry geom) -> text"
+    - "ST_GeoHash(geometry geom, integer maxchars) -> text"
+  summary: >-
+    Encodes a geometry's position as a geohash string, a base-32 encoding of
+    interleaved latitude and longitude bits. Its defining property is that the prefix is
+    the precision: two nearby places share a long common prefix, so a geohash column
+    with a btree index gives you cheap prefix-based proximity grouping, deduplication
+    and cache keys without touching a spatial index. It is not a substitute for
+    ST_DWithin - cells are rectangular in degrees and neighbouring points can land
+    either side of a cell boundary and share no prefix at all. For non-point geometries
+    PostGIS returns the hash of the bounding box, truncated to the precision where the
+    box still fits inside one cell.
+  returns: text
+  since: "1.4"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The geometry to encode. Must be in a geographic (lon/lat) CRS.
+    - name: maxchars
+      type: integer
+      description: Maximum length of the returned hash. If omitted, PostGIS chooses a length that reflects the precision of the input geometry.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_GeoHash(ST_SetSRID(ST_MakePoint(0, 0), 4326), 5) AS gh;
+    result: |2-
+        gh
+      -------
+       s0000
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT ST_GeoHash(ST_Transform(geom, 4326), 7) AS cell, count(*)
+              FROM sightings
+              WHERE observed_on = %s
+              GROUP BY 1
+              """,
+              (observed_on,),
+          )
+          cell_counts = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import func, select
+      from geoalchemy2.functions import ST_GeoHash, ST_Transform
+
+      cell = ST_GeoHash(ST_Transform(Sighting.geom, 4326), 7).label("cell")
+      stmt = select(cell, func.count()).group_by(cell)
+  srid_notes: >-
+    The docs require the input to be in geographic (lon/lat) coordinates, so a 3857 or
+    27700 column has to be wrapped in ST_Transform(geom, 4326) first. The documentation
+    states the requirement but does not specify what happens if you ignore it. Because the encoding interleaves longitude and
+    latitude bits, a cell is a rectangle in degrees and its ground footprint narrows
+    towards the poles: a 7-character cell is roughly 150 m across at the equator and
+    much narrower east-west at 60 degrees latitude. Never treat a fixed hash length as a
+    fixed distance.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not GiST-related at all. Its value is that a stored geohash column indexed with a
+      plain btree makes LIKE 'u4pru%' prefix queries and GROUP BY aggregation fast -
+      useful for tiling counts and dedup, though a functional index on ST_GeoHash(geom)
+      only helps if the expression matches the query exactly.
+  common_mistakes:
+    - "Calling it on projected geometry. The docs require geographic (lon/lat) input; do not rely on a projected column being handled sensibly."
+    - "Using shared prefixes as a proximity test. Two points a metre apart either side of a cell boundary share no prefix, so boundary neighbours are missed entirely."
+    - "Assuming a given hash length means a fixed distance, when cell width in metres shrinks with latitude."
+  see_also:
+    - ST_Transform
+    - ST_DWithin
+    - ST_SnapToGrid
+    - ST_ClusterDBSCAN
+  tags: [geohash, encoding, indexing, clustering, proximity]

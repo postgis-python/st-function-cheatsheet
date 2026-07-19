@@ -1,0 +1,692 @@
+# Geometry editors: functions that return a modified copy of their input. Coordinate systems,
+# validity, dimensionality and vertex hygiene - the cleanup layer of a spatial pipeline.
+
+- name: ST_SetSRID
+  category: editors
+  signatures:
+    - "ST_SetSRID(geom geometry, srid integer) -> geometry"
+  summary: >-
+    Stamps an SRID onto a geometry without touching a single coordinate. It is a pure
+    relabelling: you use it when the numbers are already in the right coordinate system
+    but the geometry carries SRID 0 (or the wrong code), typically after ST_MakePoint,
+    ST_GeomFromText without an SRID argument, or a load from a format that does not carry
+    CRS metadata. The distinction from ST_Transform is the single most consequential one
+    in this whole category - ST_SetSRID declares what the coordinates already mean,
+    ST_Transform changes what they are. Getting it backwards produces data that looks
+    plausible and is silently wrong.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: The geometry to relabel. Its coordinates are returned unchanged.
+    - name: srid
+      type: integer
+      description: The SRID to record, normally an EPSG code such as 4326 or 27700.
+  example:
+    sql: |-
+      SELECT ST_SRID(ST_MakePoint(-71.1, 42.4)) AS before,
+             ST_SRID(ST_SetSRID(ST_MakePoint(-71.1, 42.4), 4326)) AS after;
+    result: |2-
+       before | after
+      --------+-------
+            0 |  4326
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              INSERT INTO sightings (species, geom)
+              VALUES (%s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+              RETURNING id
+              """,
+              (species, lon, lat),
+          )
+          (new_id,) = cur.fetchone()
+    geoalchemy: |-
+      from geoalchemy2.functions import ST_MakePoint, ST_SetSRID
+
+      sighting = Sighting(
+          species=species,
+          geom=ST_SetSRID(ST_MakePoint(lon, lat), 4326),
+      )
+      session.add(sighting)
+  srid_notes: >-
+    This is the only geometry editor whose entire purpose is the SRID field, and it is
+    metadata-only: 500000 500000 labelled 4326 stays 500000 500000 and is now nonsense
+    degrees. Use ST_SetSRID when a geometry's SRID is 0 or was recorded incorrectly at
+    load time; use ST_Transform when the coordinates themselves must move between systems.
+    The classic repair for a mislabelled column is the composition
+    ST_Transform(ST_SetSRID(geom, true_srid), target_srid) - first tell PostGIS the truth,
+    then reproject. Note that inserting into a typed column geometry(Point,4326) requires
+    a matching SRID, which is why ST_SetSRID appears in almost every insert built from raw
+    lon/lat.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Cheap and constant-time, so wrapping a literal or parameter in ST_SetSRID on the
+      non-indexed side of a predicate costs nothing and keeps the query sargable. Applying
+      it to the indexed column in a WHERE clause, however, is still a function call over
+      every row and prevents the plain GiST index from being used.
+  common_mistakes:
+    - "Using ST_SetSRID where ST_Transform was meant, which relabels coordinates instead of reprojecting them and yields points in the wrong hemisphere or off the map entirely."
+    - "Building a point as ST_MakePoint(lat, lon) and then setting 4326; PostGIS expects X then Y, meaning longitude first."
+    - "Assuming a geometry with SRID 0 will be reprojected by ST_Transform - it errors instead, because there is no source CRS to transform from."
+  see_also:
+    - ST_Transform
+    - ST_SRID
+    - ST_MakePoint
+    - ST_FlipCoordinates
+    - ST_GeomFromText
+  tags: [srid, crs, metadata, constructor-support, editor]
+  docs_url: https://www.postgis-python.com/spatial-schema-migrations-and-evolution/
+
+- name: ST_Transform
+  category: editors
+  signatures:
+    - "ST_Transform(geom geometry, to_srid integer) -> geometry"
+    - "ST_Transform(geom geometry, to_proj text) -> geometry"
+    - "ST_Transform(geom geometry, from_proj text, to_srid integer) -> geometry"
+  summary: >-
+    Reprojects a geometry from its current spatial reference system into another,
+    recomputing every coordinate using PROJ. This is the function you reach for whenever
+    a calculation needs real-world units - areas in square metres, buffers in metres,
+    distances that mean something - because those only come out right in a projected CRS,
+    not in degrees. It is also how you reconcile two datasets that arrive in different
+    systems before joining them. Unlike ST_SetSRID it is genuinely expensive per row and,
+    critically, it destroys index usability when applied to an indexed column.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: Geometry to reproject. It must carry a valid non-zero source SRID known to spatial_ref_sys.
+    - name: to_srid
+      type: integer
+      description: Target SRID, which must also exist in the spatial_ref_sys table.
+    - name: to_proj
+      type: text
+      description: Alternative target given as a PROJ definition string instead of an SRID.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_SRID(p) AS srid, ROUND(ST_X(p)::numeric, 0) AS x_m
+      FROM (SELECT ST_Transform(ST_SetSRID(ST_MakePoint(-71.1, 42.4), 4326), 3857) AS p) s;
+    result: |2-
+       srid |    x_m
+      ------+----------
+       3857 | -7914816
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_Area(ST_Transform(geom, 3035)) AS area_m2
+              FROM parcels
+              WHERE geom && ST_Transform(ST_MakeEnvelope(%s, %s, %s, %s, 3035), 4326)
+              """,
+              (xmin, ymin, xmax, ymax),
+          )
+          areas = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Area, ST_MakeEnvelope, ST_Transform
+
+      box = ST_Transform(ST_MakeEnvelope(xmin, ymin, xmax, ymax, 3035), 4326)
+      stmt = select(Parcel.id, ST_Area(ST_Transform(Parcel.geom, 3035))).where(
+          Parcel.geom.bool_op("&&")(box)
+      )
+  srid_notes: >-
+    The source SRID must be present and non-zero; a geometry left at SRID 0 raises
+    "Input geometry has unknown (0) SRID" and needs ST_SetSRID first to declare what the
+    coordinates already are. Transformation accuracy depends on the datum shift PROJ
+    picks, so 4326 to a national grid such as 27700 can differ by metres between PROJ
+    versions - pin your PROJ/grid files if survey-grade repeatability matters. Remember
+    that transforming to 3857 does not give you true metres: Web Mercator distances and
+    areas are inflated by 1/cos(latitude), so use a local UTM zone or an equal-area CRS
+    for measurement. Round-tripping through a projection is lossy at the floating-point
+    level, so do not transform back and forth casually in a pipeline.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      ST_Transform(geom, ...) on an indexed column is the classic index killer: the GiST
+      index stores boxes in the column's own SRID, so a transformed expression cannot
+      match it and you get a sequential scan plus a PROJ call per row. Transform the
+      constant into the column's SRID instead and leave the column bare. If you genuinely
+      query in the other CRS all the time, either add an expression index
+      (CREATE INDEX ... USING gist (ST_Transform(geom, 3857))) or store a second
+      materialised geometry column and index that.
+  common_mistakes:
+    - "Wrapping the indexed column - WHERE ST_Transform(geom, 3857) && :box - instead of transforming the box into the column's SRID, which turns a fast index scan into a full table scan."
+    - "Confusing it with ST_SetSRID and reprojecting data that was never in the SRID PostGIS thinks it is in; check with ST_SRID and a sanity plot before transforming."
+    - "Measuring areas and distances in 3857 and reporting them as metres, when Web Mercator scale error grows sharply with latitude."
+    - "Transforming to a target SRID that is missing from spatial_ref_sys, which fails at runtime rather than at deploy time."
+  see_also:
+    - ST_SetSRID
+    - ST_SRID
+    - ST_Area
+    - ST_Distance
+    - ST_Buffer
+  tags: [srid, crs, reprojection, proj, index-killer]
+  docs_url: https://www.postgis-python.com/spatial-schema-migrations-and-evolution/
+
+- name: ST_MakeValid
+  category: editors
+  signatures:
+    - "ST_MakeValid(geom geometry) -> geometry"
+    - "ST_MakeValid(geom geometry, params text) -> geometry"
+  summary: >-
+    Takes an invalid geometry and returns a valid one that represents the same set of
+    points as closely as the OGC rules allow, without dropping vertices. It is the
+    standard remedy for self-intersecting "bowtie" polygons, rings that touch at a point,
+    and duplicated or reversed rings that arrive from shapefiles, CAD exports and
+    user-drawn shapes. Because overlay operations such as ST_Intersection and ST_Union
+    throw GEOS TopologyException errors on invalid input, running ST_MakeValid at load
+    time is usually cheaper than debugging failures downstream. Be aware that the fix can
+    change the geometry type - a bowtie polygon comes back as a MultiPolygon.
+  returns: geometry
+  since: "2.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: Possibly invalid input geometry. Valid input is returned unchanged.
+    - name: params
+      type: text
+      description: Options string selecting the algorithm, e.g. 'method=structure'. PostGIS 3.2+ with GEOS 3.10+.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_IsValid('POLYGON((0 0, 1 1, 1 0, 0 1, 0 0))'::geometry) AS before,
+             ST_IsValid(ST_MakeValid('POLYGON((0 0, 1 1, 1 0, 0 1, 0 0))'::geometry)) AS after;
+    result: |2-
+       before | after
+      --------+-------
+       f      | t
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              UPDATE landuse
+              SET geom = ST_Multi(ST_MakeValid(geom))
+              WHERE NOT ST_IsValid(geom)
+              """
+          )
+          repaired = cur.rowcount
+    geoalchemy: |-
+      from sqlalchemy import select, update
+      from geoalchemy2.functions import ST_IsValid, ST_MakeValid, ST_Multi
+
+      stmt = (
+          update(Landuse)
+          .where(ST_IsValid(Landuse.geom).is_(False))
+          .values(geom=ST_Multi(ST_MakeValid(Landuse.geom)))
+      )
+  srid_notes: >-
+    The SRID is preserved unchanged, but validity itself is evaluated planar in the
+    column's own coordinate system - a polygon can be valid in 4326 and, after
+    ST_Transform, acquire a self-intersection from floating-point rounding at the new
+    scale. Validate after reprojecting, not only before. There is no geography version:
+    cast or transform to geometry to repair, then convert back. Polygons that cross the
+    antimeridian in 4326 are a separate problem that ST_MakeValid will not solve.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not indexable and moderately expensive, so never call it inline in a join predicate.
+      Repair once in an UPDATE (batched, since rewriting a large table bloats it) or in a
+      trigger on write, then query the clean column. A partial index on WHERE NOT
+      ST_IsValid(geom) makes finding the remaining offenders cheap.
+  common_mistakes:
+    - "Assuming the geometry type survives. A self-intersecting polygon becomes a MultiPolygon, which fails to insert into a geometry(Polygon,...) column unless you wrap it in ST_Multi."
+    - "Calling it inside a spatial join instead of fixing the data once; every row pays the GEOS cost and the index is bypassed."
+    - "Treating the output as authoritative geography. ST_MakeValid preserves points, not intent - a bowtie parcel may come back as two lobes that no surveyor would recognise."
+  see_also:
+    - ST_IsValid
+    - ST_IsValidReason
+    - ST_Multi
+    - ST_Union
+    - ST_Buffer
+  tags: [validity, repair, geos, topology, editor]
+
+- name: ST_Force2D
+  category: editors
+  signatures:
+    - "ST_Force2D(geom geometry) -> geometry"
+  summary: >-
+    Strips the Z and M ordinates from a geometry, returning a plain 2D version. You need
+    it when data captured with elevation or measure values has to land in a strictly 2D
+    column, be compared with 2D-only geometries, or be serialised to a format and client
+    that would choke on a third ordinate. It is also the cheapest way to shrink storage
+    and index size when the Z values are noise from a GPS or CAD source rather than
+    meaningful. Note that it is a no-op on geometries that are already 2D, so it is safe
+    to apply blanket in an ETL step.
+  returns: geometry
+  since: "1.0 (as ST_Force_2D; renamed to ST_Force2D in 2.1)"
+  arguments:
+    - name: geom
+      type: geometry
+      description: Input geometry with any dimensionality; Z and M are discarded.
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_Force2D('POINT Z (1 2 3)'::geometry)) AS flat;
+    result: |2-
+          flat
+      ------------
+       POINT(1 2)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              INSERT INTO road_centrelines_2d (road_id, geom)
+              SELECT road_id, ST_Force2D(geom) FROM road_survey WHERE batch = %s
+              """,
+              (batch_id,),
+          )
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Force2D
+
+      stmt = select(RoadSurvey.road_id, ST_Force2D(RoadSurvey.geom))
+  srid_notes: >-
+    The SRID is untouched, which matters because ST_Transform reprojects X and Y but
+    generally leaves Z alone - a table transformed from feet-based state plane to metres
+    may carry Z still in feet. Dropping Z with ST_Force2D removes that inconsistency
+    rather than hiding it. Remember that the default 2D GiST index ignores Z anyway, so
+    forcing 2D changes nothing about index behaviour unless you were using the ND operator
+    class.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Very cheap but still a per-row function, so do not wrap an indexed column in it
+      inside a WHERE clause. If your workload is entirely 2D against 3D-stored data,
+      materialise a forced-2D column and index that instead of forcing at query time.
+  common_mistakes:
+    - "Expecting the ND operator &&& to keep working afterwards; with Z gone it degenerates to a 2D box test."
+    - "Using it to 'flatten' a 3D polygon that is not planar, which can produce a self-intersecting 2D shape needing ST_MakeValid."
+    - "Assuming ST_AsGeoJSON needs it. GeoJSON output does carry Z as a third position element, so forcing 2D is a choice, not a requirement."
+  see_also:
+    - ST_MakeValid
+    - ST_Dimension
+    - ST_NPoints
+    - "&&&"
+  tags: [dimension, 3d, flatten, etl, editor]
+
+- name: ST_Multi
+  category: editors
+  signatures:
+    - "ST_Multi(geom geometry) -> geometry"
+  summary: >-
+    Wraps a single geometry in its corresponding multi-type, turning a Polygon into a
+    MultiPolygon, a LineString into a MultiLineString and so on, while leaving inputs that
+    are already multi untouched. Its main use is schema conformance: PostGIS typed columns
+    such as geometry(MultiPolygon,4326) reject a bare Polygon, and shapefile-derived
+    tables are almost always declared multi because the format cannot distinguish the two.
+    It is also the standard tail of a repair pipeline, since ST_MakeValid and overlay
+    functions return whichever type the result happens to be. The operation is metadata
+    only - no coordinate changes and no merging of parts.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: Any geometry. Single types are promoted; multi types and collections are returned as-is.
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_Multi('POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))'::geometry)) AS wkt;
+    result: |2-
+                       wkt
+      ---------------------------------------
+       MULTIPOLYGON(((0 0,0 1,1 1,1 0,0 0)))
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              INSERT INTO admin_boundaries (name, geom)
+              VALUES (%s, ST_Multi(ST_SetSRID(ST_GeomFromText(%s), 4326)))
+              """,
+              (name, polygon_wkt),
+          )
+    geoalchemy: |-
+      from geoalchemy2.functions import ST_GeomFromText, ST_Multi, ST_SetSRID
+
+      boundary = AdminBoundary(
+          name=name,
+          geom=ST_Multi(ST_SetSRID(ST_GeomFromText(polygon_wkt), 4326)),
+      )
+      session.add(boundary)
+  srid_notes: >-
+    SRID passes through unchanged, so ST_Multi never rescues an SRID mismatch - a typed
+    column geometry(MultiPolygon,4326) enforces both the type and the code, and only
+    ST_SetSRID or ST_Transform can satisfy the second. Order the calls so the SRID is
+    correct before or inside the wrap; the result is identical either way, but keeping
+    ST_SetSRID innermost reads more clearly as "make the geometry right, then fit the
+    column".
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      No effect on indexing: the bounding box of a promoted geometry is identical to the
+      original's, and GiST predicates behave the same. Like any function it should not
+      wrap the indexed column in a WHERE clause.
+  common_mistakes:
+    - "Expecting it to dissolve or merge parts. It only wraps; use ST_Union or ST_Collect to combine separate geometries."
+    - "Applying it to a GeometryCollection and expecting a homogeneous multi-type; collections come back unchanged."
+    - "Forgetting it after ST_MakeValid or ST_Intersection, then hitting a type constraint violation on insert."
+  see_also:
+    - ST_Collect
+    - ST_Union
+    - ST_MakeValid
+    - ST_GeometryType
+    - ST_NumGeometries
+  tags: [type-coercion, multi, schema, insert, editor]
+  docs_url: https://www.postgis-python.com/sqlalchemy-and-geoalchemy-integration-workflows/
+
+- name: ST_SnapToGrid
+  category: editors
+  signatures:
+    - "ST_SnapToGrid(geom geometry, size float8) -> geometry"
+    - "ST_SnapToGrid(geom geometry, sizeX float8, sizeY float8) -> geometry"
+    - "ST_SnapToGrid(geom geometry, originX float8, originY float8, sizeX float8, sizeY float8) -> geometry"
+  summary: >-
+    Rounds every vertex of a geometry onto a regular grid of the given cell size, then
+    removes consecutive points that collapsed onto the same node. It is the pragmatic way
+    to kill floating-point noise: two polygons digitised from the same boundary that
+    differ in the twelfth decimal place will not share edges, and snapping both to a
+    sensible precision makes them line up so overlays stop producing slivers. It is also a
+    cheap size reduction for tile and API output where sub-millimetre precision is
+    meaningless. Snapping can invalidate a geometry by collapsing a thin sliver, so pair
+    it with a validity check on complex polygons.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: Geometry whose vertices are rounded to the grid.
+    - name: size
+      type: float8
+      description: Grid cell size in SRID units, applied to both X and Y.
+    - name: sizeX
+      type: float8
+      description: Grid cell size along X, when specifying axes separately.
+      optional: true
+    - name: sizeY
+      type: float8
+      description: Grid cell size along Y, when specifying axes separately.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_SnapToGrid('POINT(1.2345 2.6789)'::geometry, 0.01)) AS snapped;
+    result: |2-
+          snapped
+      -------------------
+       POINT(1.23 2.68)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, ST_AsGeoJSON(ST_SnapToGrid(geom, %s)) AS geojson
+              FROM coastline
+              WHERE region = %s
+              """,
+              (grid_size, region),
+          )
+          simplified = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_AsGeoJSON, ST_SnapToGrid
+
+      stmt = select(
+          Coastline.id,
+          ST_AsGeoJSON(ST_SnapToGrid(Coastline.geom, 0.0001)),
+      ).where(Coastline.region == region)
+  srid_notes: >-
+    The grid size is in SRID units, and the difference is dramatic: 0.0001 on 4326 is
+    about 11 metres near the equator, while 0.0001 on a metric SRID is a tenth of a
+    millimetre. On 4326 the grid is also anisotropic - a fixed degree cell is much
+    narrower on the ground east-west at high latitudes - so if you need uniform ground
+    precision, ST_Transform to a projected SRID, snap there, and transform back. Choose
+    the size from the real accuracy of the source data, not from what looks tidy.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Per-row and not indexable, so use it in projection lists, materialised views or ETL
+      writes rather than in predicates. Snapped geometries have fewer vertices, which
+      makes downstream GiST rechecks and overlay operations measurably cheaper.
+  common_mistakes:
+    - "Picking a grid size in metres for a 4326 column, which snaps everything to a handful of nodes and destroys the data."
+    - "Assuming the result is still valid; collapsing vertices can create self-intersections, so follow with ST_IsValid or ST_MakeValid on polygon layers."
+    - "Using it as a simplification tool for dense lines - it removes duplicates, not detail; ST_Simplify is the right function for shape reduction."
+  see_also:
+    - ST_Simplify
+    - ST_RemoveRepeatedPoints
+    - ST_MakeValid
+    - ST_NPoints
+    - ST_AsMVTGeom
+  tags: [precision, grid, snapping, slivers, editor]
+
+- name: ST_Reverse
+  category: editors
+  signatures:
+    - "ST_Reverse(geom geometry) -> geometry"
+  summary: >-
+    Returns the geometry with the order of its vertices reversed. For linestrings that
+    flips the direction of travel, which matters for linear referencing, routing segments
+    and any styling that draws arrows or offsets along a line. For polygons it flips ring
+    orientation, which some consumers - notably certain GeoJSON clients following the
+    right-hand rule, and shapefile writers - care about even though PostGIS itself does
+    not treat orientation as part of validity. Reach for it when a digitised line runs
+    against the direction of flow or traffic.
+  returns: geometry
+  since: "1.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: Geometry whose vertex order is reversed; coordinates themselves are unchanged.
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_Reverse('LINESTRING(0 0, 1 1, 2 2)'::geometry)) AS reversed;
+    result: |2-
+             reversed
+      -------------------------
+       LINESTRING(2 2,1 1,0 0)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              UPDATE river_reaches
+              SET geom = ST_Reverse(geom)
+              WHERE id = ANY(%s)
+              """,
+              (misdigitised_ids,),
+          )
+    geoalchemy: |-
+      from sqlalchemy import update
+      from geoalchemy2.functions import ST_Reverse
+
+      stmt = (
+          update(RiverReach)
+          .where(RiverReach.id.in_(misdigitised_ids))
+          .values(geom=ST_Reverse(RiverReach.geom))
+      )
+  srid_notes: >-
+    No coordinate values and no SRID change - the bounding box is identical, so nothing
+    about the CRS is affected. The one CRS-adjacent trap is that direction-dependent
+    results computed elsewhere, such as ST_Azimuth or ST_LineLocatePoint fractions, are
+    measured in the geometry's own SRID and will change meaning once you reverse; recompute
+    any cached measures after a reversal rather than assuming they still hold.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Irrelevant to indexing - the box is unchanged, so a stored index stays valid after an
+      UPDATE only in the sense that the entries do not move. As always, do not wrap the
+      indexed column in it inside a predicate.
+  common_mistakes:
+    - "Expecting ST_Equals to change. Two geometries with the same points in opposite order are spatially equal, so a reversal is invisible to most predicates."
+    - "Reversing a line without recomputing linear-referencing measures, silently inverting every ST_LineLocatePoint fraction that depended on it."
+    - "Using it to fix polygon 'validity'; PostGIS validity does not depend on ring orientation, so a reversal will not repair an invalid polygon."
+  see_also:
+    - ST_LineLocatePoint
+    - ST_LineInterpolatePoint
+    - ST_Azimuth
+    - ST_Equals
+  tags: [direction, vertex-order, linear-referencing, orientation, editor]
+
+- name: ST_RemoveRepeatedPoints
+  category: editors
+  signatures:
+    - "ST_RemoveRepeatedPoints(geom geometry, tolerance float8 = 0.0) -> geometry"
+  summary: >-
+    Removes consecutive duplicate vertices from a geometry, optionally treating points
+    closer together than a tolerance as duplicates. Repeated points are a common artefact
+    of GPS traces recorded while stationary, of digitising software that emits a vertex per
+    mouse event, and of naive coordinate rounding - they bloat storage, slow down every
+    GEOS operation, and can render a polygon invalid. Unlike ST_Simplify it never removes a
+    vertex that changes the shape beyond the tolerance you give, so it is the conservative
+    first pass in a geometry cleanup pipeline before any real generalisation.
+  returns: geometry
+  since: "2.2"
+  arguments:
+    - name: geom
+      type: geometry
+      description: Geometry to de-duplicate. Collections are processed component by component.
+    - name: tolerance
+      type: float8
+      description: Distance in SRID units below which consecutive vertices are considered the same point. Default 0 removes only exact duplicates.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_AsText(
+               ST_RemoveRepeatedPoints('LINESTRING(0 0, 0 0, 1 1, 1 1, 2 2)'::geometry)
+             ) AS cleaned;
+    result: |2-
+              cleaned
+      -------------------------
+       LINESTRING(0 0,1 1,2 2)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              UPDATE gps_tracks
+              SET geom = ST_RemoveRepeatedPoints(geom, %s)
+              WHERE ST_NPoints(geom) > %s
+              """,
+              (tolerance, min_points),
+          )
+          cleaned = cur.rowcount
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_NPoints, ST_RemoveRepeatedPoints
+
+      stmt = select(
+          GpsTrack.id,
+          ST_NPoints(ST_RemoveRepeatedPoints(GpsTrack.geom, 0.5)),
+      )
+  srid_notes: >-
+    The tolerance is in SRID units, so a value tuned for a metric projection is
+    catastrophic on 4326 - 0.5 degrees would collapse a national dataset, where 0.5 metres
+    is exactly the GPS jitter you meant to remove. If your data is geographic and you want
+    a metric tolerance, transform first or convert the metres to degrees for the relevant
+    latitude and accept the anisotropy. With the default tolerance of 0 the function is
+    SRID-agnostic, since exact duplicates are exact in any coordinate system.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not a predicate and not indexable, but it is one of the highest-leverage cleanups for
+      index performance: fewer vertices means smaller geometries, faster GiST recheck steps
+      and less TOAST traffic. Run it as a batched UPDATE at load time.
+  common_mistakes:
+    - "Assuming it simplifies a line. It only drops consecutive near-duplicates; a dense but non-repeating polyline is untouched, and ST_Simplify is the right tool there."
+    - "Passing a tolerance in metres against a 4326 column and collapsing whole features to a couple of vertices."
+    - "Expecting it to remove non-consecutive duplicates, such as a coordinate that reappears later in the ring; it will not."
+  see_also:
+    - ST_Simplify
+    - ST_SnapToGrid
+    - ST_NPoints
+    - ST_MakeValid
+    - ST_MemSize
+  tags: [cleanup, vertices, duplicates, gps, editor]
+
+- name: ST_FlipCoordinates
+  category: editors
+  signatures:
+    - "ST_FlipCoordinates(geom geometry) -> geometry"
+  summary: >-
+    Swaps the X and Y ordinate of every vertex, returning the geometry with its axes
+    exchanged. It exists almost entirely for one problem: data loaded as latitude-longitude
+    when PostGIS, GeoJSON and WKT all expect longitude-latitude, which leaves points
+    stranded in the wrong ocean. It is also the fix when a source honours the EPSG
+    authority's official 4326 axis order (lat, lon) rather than the traditional GIS order.
+    Diagnose before you apply it - flipping data that was already correct produces exactly
+    the same kind of nonsense, only in the other direction.
+  returns: geometry
+  since: "2.0"
+  arguments:
+    - name: geom
+      type: geometry
+      description: Geometry whose X and Y ordinates are exchanged. Z and M are left alone.
+  example:
+    sql: |-
+      SELECT ST_AsText(ST_FlipCoordinates('POINT(1 2)'::geometry)) AS flipped;
+    result: |2-
+        flipped
+      ------------
+       POINT(2 1)
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              UPDATE imported_stations
+              SET geom = ST_FlipCoordinates(geom)
+              WHERE ST_X(geom) BETWEEN %s AND %s
+              """,
+              (-90, 90),
+          )
+          fixed = cur.rowcount
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_FlipCoordinates, ST_X
+
+      stmt = select(Station.id, ST_FlipCoordinates(Station.geom)).where(
+          ST_X(Station.geom).between(-90, 90)
+      )
+  srid_notes: >-
+    The SRID is preserved and no reprojection happens, which is precisely why this is the
+    right tool for axis-order bugs and ST_Transform is not - the coordinates are already in
+    the correct CRS, they are merely in the wrong slots. A useful detector on 4326 data is
+    that a valid longitude runs to 180 while latitude stops at 90, so any row with
+    abs(ST_X(geom)) > 90 was probably not flipped; rows entirely within 90 are ambiguous
+    and need another signal such as a known country boundary. On projected SRIDs where both
+    axes have similar ranges there is no such heuristic, so verify against a reference
+    dataset before running a bulk flip.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      Not indexable, and a bulk flip rewrites every row's bounding box, so the GiST index
+      must be rebuilt or at least heavily vacuumed afterwards. Do the flip once during
+      import, before the index is created, whenever you have the choice.
+  common_mistakes:
+    - "Flipping a whole table without checking which rows are actually wrong, thereby breaking the correct ones."
+    - "Reaching for ST_Transform to fix swapped axes, which reprojects nonsense into different nonsense instead of correcting the ordering."
+    - "Forgetting that ST_MakePoint takes X (longitude) first, so the flip is a symptom of an upstream bug that will keep reintroducing bad rows."
+  see_also:
+    - ST_SetSRID
+    - ST_Transform
+    - ST_X
+    - ST_Y
+    - ST_MakePoint
+  tags: [axis-order, lat-lon, import-fix, coordinates, editor]
+  docs_url: https://www.postgis-python.com/spatial-schema-migrations-and-evolution/

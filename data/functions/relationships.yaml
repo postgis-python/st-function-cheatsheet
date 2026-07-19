@@ -1,0 +1,1004 @@
+# Topological and proximity predicates. Almost all of these are DE-9IM tests that PostGIS
+# rewrites into an && bounding-box term plus an exact recheck - the notable exception is ST_Disjoint.
+
+- name: ST_Intersects
+  category: relationships
+  signatures:
+    - "ST_Intersects(geometry A, geometry B) -> boolean"
+    - "ST_Intersects(geography A, geography B) -> boolean"
+  summary: >-
+    Returns true when two geometries share any point at all, whether that point is in an
+    interior or on a boundary. It is the workhorse predicate of spatial SQL and the right
+    default for "does this feature touch that feature" and for joining two layers together,
+    because it is the union of contains, within, touches, crosses and overlaps. Reach for it
+    unless you specifically need to exclude boundary-only contact, in which case use
+    ST_Overlaps or ST_ContainsProperly. It is the exact logical negation of ST_Disjoint but,
+    unlike ST_Disjoint, it is index-assisted.
+  returns: boolean
+  since: "1.0 (geography since 1.5)"
+  arguments:
+    - name: A
+      type: geometry
+      description: First geometry; when written against a table this should be the indexed column.
+    - name: B
+      type: geometry
+      description: Second geometry, commonly a constant, parameter or the other side of a join.
+  example:
+    sql: |-
+      SELECT ST_Intersects('LINESTRING(0 0, 10 10)'::geometry, 'POINT(5 5)'::geometry) AS on_line,
+             ST_Intersects('LINESTRING(0 0, 10 10)'::geometry, 'POINT(9 1)'::geometry) AS off_line;
+    result: |2-
+       on_line | off_line
+      ---------+----------
+       t       | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT p.id, z.name
+              FROM parcels p
+              JOIN flood_zones z ON ST_Intersects(p.geom, z.geom)
+              WHERE p.id = %s
+              """,
+              (parcel_id,),
+          )
+          zones = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Intersects
+
+      stmt = (
+          select(Parcel.id, FloodZone.name)
+          .join(FloodZone, ST_Intersects(Parcel.geom, FloodZone.geom))
+          .where(Parcel.id == parcel_id)
+      )
+  srid_notes: >-
+    Both arguments must share an SRID or the call errors with "Operation on mixed SRID
+    geometries"; there is no implicit reprojection. The geometry form is purely planar, so
+    on 4326 two features either share a coordinate or they do not - latitude distortion is
+    irrelevant to a yes/no intersection test. The geography form does use great-circle edges,
+    which means a long segment between two lon/lat points can intersect a polygon under
+    geography that it misses under geometry.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      ST_Intersects automatically emits an && term against the bounding boxes, so a GiST
+      index on either column is used without any extra help. Adding your own && alongside it
+      is redundant. Wrapping the indexed column in ST_Transform or ST_Buffer defeats the
+      index - transform the constant side instead.
+  common_mistakes:
+    - "Adding a hand-written && next to ST_Intersects. The planner already generates that term; the duplicate only costs planning time."
+    - "Calling ST_Transform on the indexed column to match the other SRID, which forces a sequential scan. Transform the literal, or store a second projected column."
+    - "Assuming it excludes boundary-only contact. Two polygons that merely share an edge do intersect; use ST_Overlaps if you want genuine area overlap."
+  see_also:
+    - ST_Disjoint
+    - ST_Contains
+    - ST_DWithin
+    - "&&"
+    - ST_Relate
+  tags: [predicate, de9im, join, index, gist]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: ST_Contains
+  category: relationships
+  signatures:
+    - "ST_Contains(geometry A, geometry B) -> boolean"
+  summary: >-
+    Returns true when B lies entirely inside A and at least one point of B is in the interior
+    of A. That second clause is the part that surprises people: a point sitting exactly on
+    A's boundary is not contained, and neither is a line that runs entirely along A's edge.
+    Use it for point-in-polygon assignment and for "which region does this feature fall in"
+    when you are happy for boundary cases to be excluded; use ST_Covers when you are not.
+    Since PostGIS 2.3 the point-in-polygon case has a short-circuit path that makes it
+    noticeably faster than the general DE-9IM evaluation.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: The candidate container. In a table query this is normally the polygon column.
+    - name: B
+      type: geometry
+      description: The candidate contained geometry.
+  example:
+    sql: |-
+      SELECT ST_Contains('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry,
+                         'POINT(5 5)'::geometry) AS interior_point,
+             ST_Contains('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry,
+                         'POINT(0 5)'::geometry) AS boundary_point;
+    result: |2-
+       interior_point | boundary_point
+      ----------------+----------------
+       t              | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT d.district_code
+              FROM districts d
+              WHERE ST_Contains(d.geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+              """,
+              (lon, lat),
+          )
+          district = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Contains, ST_MakePoint, ST_SetSRID
+
+      here = ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+      stmt = select(District.district_code).where(ST_Contains(District.geom, here))
+  srid_notes: >-
+    Mixed SRIDs error rather than reproject. The test is planar, so a polygon defined in 4326
+    is treated as a straight-edged shape in degree space; for very large administrative
+    polygons the straight-line edges differ from the geodesic ones and a point near an edge
+    can flip. There is no geography form of ST_Contains at all - cast to geometry, or use
+    ST_Covers, which does have one.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Emits an && term on A's box containing B's box, so a GiST index on the polygon column
+      is used directly. For a handful of very complex polygons, ST_Subdivide-ing them first
+      shrinks the boxes and dramatically improves the index's selectivity.
+  common_mistakes:
+    - "Expecting a point exactly on the polygon edge to be contained. It is not - ST_Contains requires interior intersection, ST_Covers does not."
+    - "Getting the argument order backwards. ST_Contains(container, thing) is the reverse of ST_Within(thing, container)."
+    - "Reaching for a geography version. None exists; ST_Covers is the geography-capable near-equivalent."
+  see_also:
+    - ST_Within
+    - ST_Covers
+    - ST_ContainsProperly
+    - ST_Intersects
+    - "~"
+  tags: [predicate, de9im, point-in-polygon, containment, index]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: ST_ContainsProperly
+  category: relationships
+  signatures:
+    - "ST_ContainsProperly(geometry A, geometry B) -> boolean"
+  summary: >-
+    Returns true when B intersects the interior of A but touches neither A's boundary nor its
+    exterior - strict interior containment. The practical difference from ST_Contains is that
+    anything grazing the edge is rejected, including A itself: a geometry does not properly
+    contain itself, because its own boundary is not interior. It is also measurably faster
+    than ST_Contains when you test one prepared polygon against many candidates, which is why
+    it appears in tuned batch clipping and tiling queries.
+  returns: boolean
+  since: "1.4"
+  arguments:
+    - name: A
+      type: geometry
+      description: The candidate container; only its interior counts.
+    - name: B
+      type: geometry
+      description: The candidate contained geometry, which must avoid A's boundary entirely.
+  example:
+    sql: |-
+      SELECT ST_ContainsProperly('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry,
+                                 'POINT(5 5)'::geometry) AS interior_point,
+             ST_ContainsProperly('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry,
+                                 'POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry) AS itself;
+    result: |2-
+       interior_point | itself
+      ----------------+--------
+       t              | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT b.id
+              FROM buildings b
+              WHERE ST_ContainsProperly(%s::geometry, b.geom)
+              """,
+              (tile_ewkt,),
+          )
+          fully_inside = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_ContainsProperly
+
+      stmt = select(Building.id).where(ST_ContainsProperly(tile_geom, Building.geom))
+  srid_notes: >-
+    Same mixed-SRID error and same planar semantics as ST_Contains, and likewise there is no
+    geography form. Because the predicate hinges on exact boundary coincidence, it is
+    unusually sensitive to coordinate precision: reprojecting one side with ST_Transform can
+    move a shared vertex by a few floating-point units and turn a false into a true.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Index-assisted through the same && rewrite as ST_Contains. Its real advantage shows in
+      tiling workloads where one constant polygon is tested against many rows and GEOS can
+      reuse a prepared version of it.
+  common_mistakes:
+    - "Assuming ST_ContainsProperly(A, A) is true. It is false, because A's boundary is not part of A's interior."
+    - "Using it for ordinary point-in-polygon lookups, where it silently drops points that landed exactly on a shared district edge."
+    - "Treating it as a drop-in speed-up for ST_Contains. The results differ for every boundary-touching case."
+  see_also:
+    - ST_Contains
+    - ST_Covers
+    - ST_Within
+    - ST_Relate
+  tags: [predicate, de9im, containment, interior, index]
+
+- name: ST_Within
+  category: relationships
+  signatures:
+    - "ST_Within(geometry A, geometry B) -> boolean"
+  summary: >-
+    Returns true when A lies completely inside B, with at least one point of A in B's
+    interior. It is exactly ST_Contains with the arguments swapped, and it exists so you can
+    write the query in whichever direction reads naturally - and, more usefully, so the
+    indexed column can sit in the first position. As with ST_Contains, a geometry that only
+    touches B's boundary is not within it.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: The candidate inner geometry. Put your indexed column here.
+    - name: B
+      type: geometry
+      description: The candidate container, often a constant envelope or an area of interest.
+  example:
+    sql: |-
+      SELECT ST_Within('POINT(5 5)'::geometry,
+                       'POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry) AS inside,
+             ST_Within('POINT(0 5)'::geometry,
+                       'POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry) AS on_edge;
+    result: |2-
+       inside | on_edge
+      --------+---------
+       t      | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, species
+              FROM trees
+              WHERE ST_Within(geom, ST_MakeEnvelope(%s, %s, %s, %s, 27700))
+              """,
+              (xmin, ymin, xmax, ymax),
+          )
+          in_view = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_MakeEnvelope, ST_Within
+
+      box = ST_MakeEnvelope(xmin, ymin, xmax, ymax, 27700)
+      stmt = select(Tree.id, Tree.species).where(ST_Within(Tree.geom, box))
+  srid_notes: >-
+    Planar, SRID units, mixed SRIDs raise an error. When filtering to a viewport, build the
+    envelope in the column's own SRID with ST_MakeEnvelope(..., srid) rather than transforming
+    the column - the latter is correct but unindexable. No geography form exists; ST_CoveredBy
+    is the geography-capable alternative.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Generates an @ box-containment term internally, so a GiST index on A is used when B is
+      a constant or parameter. This is the idiomatic spelling for viewport and area-of-interest
+      filters against an indexed geometry column.
+  common_mistakes:
+    - "Swapping the arguments with ST_Contains, which returns wrong rows silently rather than erroring."
+    - "Using ST_Within for a viewport clip when you actually want partially visible features too - that is ST_Intersects."
+    - "Expecting features flush against the area-of-interest boundary to be included; they are not, use ST_CoveredBy."
+  see_also:
+    - ST_Contains
+    - ST_CoveredBy
+    - ST_Intersects
+    - "@"
+    - ST_MakeEnvelope
+  tags: [predicate, de9im, containment, viewport, index]
+
+- name: ST_Covers
+  category: relationships
+  signatures:
+    - "ST_Covers(geometry A, geometry B) -> boolean"
+    - "ST_Covers(geography A, geography B) -> boolean"
+  summary: >-
+    Returns true when no point of B lies outside A. This is the containment test most people
+    actually mean: unlike ST_Contains it has no interior-intersection requirement, so a point
+    on A's boundary is covered, and a line running along A's edge is covered. It is also
+    slightly cheaper to evaluate than ST_Contains because it needs a simpler DE-9IM check, and
+    it is the only containment predicate with a geography implementation. Prefer it whenever
+    boundary cases in your data are real - shared administrative edges, snapped-to-edge points,
+    parcels that abut their district outline.
+  returns: boolean
+  since: "1.2.2 (geography since 1.5)"
+  arguments:
+    - name: A
+      type: geometry
+      description: The covering geometry.
+    - name: B
+      type: geometry
+      description: The covered geometry; no part of it may fall outside A.
+  example:
+    sql: |-
+      SELECT ST_Covers('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry,
+                       'POINT(0 5)'::geometry) AS covers_edge,
+             ST_Contains('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry,
+                         'POINT(0 5)'::geometry) AS contains_edge;
+    result: |2-
+       covers_edge | contains_edge
+      -------------+---------------
+       t           | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT c.name
+              FROM countries c
+              WHERE ST_Covers(c.geog, ST_MakePoint(%s, %s)::geography)
+              """,
+              (lon, lat),
+          )
+          country = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2 import Geography
+      from geoalchemy2.functions import ST_Covers, ST_MakePoint
+
+      here = ST_MakePoint(lon, lat).cast(Geography)
+      stmt = select(Country.name).where(ST_Covers(Country.geog, here))
+  srid_notes: >-
+    The geometry form is planar and errors on mixed SRIDs. The geography form assumes
+    lon/lat on the spheroid (SRID 4326) and follows geodesic edges, so a coastline polygon
+    can cover a point under geography that the planar test misses, or vice versa, wherever
+    edges span many degrees. Do not mix the two forms in one query and expect identical
+    answers near long edges.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Index-assisted via the usual && rewrite, for both geometry and geography. Geography
+      GiST indexes are built on geodetic boxes, so the same query shape works unchanged
+      against a geography column.
+  common_mistakes:
+    - "Reaching for ST_Contains out of habit and then losing rows whose points were snapped exactly onto a shared boundary."
+    - "Assuming the geometry and geography forms agree. They use different edge models and disagree near long or high-latitude edges."
+    - "Reversing the arguments; ST_Covers(container, thing) is the mirror of ST_CoveredBy(thing, container)."
+  see_also:
+    - ST_CoveredBy
+    - ST_Contains
+    - ST_ContainsProperly
+    - ST_Intersects
+  tags: [predicate, de9im, containment, geography, boundary]
+
+- name: ST_CoveredBy
+  category: relationships
+  signatures:
+    - "ST_CoveredBy(geometry A, geometry B) -> boolean"
+    - "ST_CoveredBy(geography A, geography B) -> boolean"
+  summary: >-
+    Returns true when no point of A lies outside B - ST_Covers with the arguments reversed.
+    It stands to ST_Within exactly as ST_Covers stands to ST_Contains: same shape of test,
+    but boundary contact counts. Use it for "is this feature entirely inside my area of
+    interest" when features legitimately abut the boundary, and to keep the indexed column
+    in the leading position.
+  returns: boolean
+  since: "1.2.2"
+  arguments:
+    - name: A
+      type: geometry
+      description: The covered geometry. Put your indexed column here.
+    - name: B
+      type: geometry
+      description: The covering geometry, typically a constant area of interest.
+  example:
+    sql: |-
+      SELECT ST_CoveredBy('POINT(0 5)'::geometry,
+                          'POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry) AS covered,
+             ST_Within('POINT(0 5)'::geometry,
+                       'POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry) AS within;
+    result: |2-
+       covered | within
+      ---------+--------
+       t       | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT count(*)
+              FROM cadastral_lots
+              WHERE ST_CoveredBy(geom, %s::geometry)
+              """,
+              (survey_area_ewkt,),
+          )
+          (fully_inside,) = cur.fetchone()
+    geoalchemy: |-
+      from sqlalchemy import func, select
+      from geoalchemy2.functions import ST_CoveredBy
+
+      stmt = (
+          select(func.count())
+          .select_from(CadastralLot)
+          .where(ST_CoveredBy(CadastralLot.geom, survey_area))
+      )
+  srid_notes: >-
+    Mixed SRIDs error in the geometry form. This predicate is the one most often used against
+    a hand-drawn area of interest arriving from a web client in 4326 while the table sits in a
+    projected SRID - transform the incoming polygon once, not the column, or the GiST index
+    goes unused. The geography form measures containment on the spheroid with geodesic edges.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Index-assisted on A through an internal box-containment term. Both geometry and
+      geography columns are supported, and the leading-argument position is what lets the
+      planner pick the index on your table.
+  common_mistakes:
+    - "Confusing it with ST_Covers and getting exactly inverted results with no error."
+    - "Transforming the indexed column instead of the constant polygon, which disables the index."
+    - "Assuming it is the same as ST_Within. It differs precisely for features that touch the boundary."
+  see_also:
+    - ST_Covers
+    - ST_Within
+    - ST_Contains
+    - ST_Intersects
+  tags: [predicate, de9im, containment, geography, boundary]
+
+- name: ST_DWithin
+  category: relationships
+  signatures:
+    - "ST_DWithin(geometry A, geometry B, double precision distance) -> boolean"
+    - "ST_DWithin(geography A, geography B, double precision distance_meters, boolean use_spheroid = true) -> boolean"
+  summary: >-
+    Returns true when the two geometries are within the given distance of each other,
+    measured between their closest points. It is the correct way to write a radius filter:
+    unlike a bare "ST_Distance(a, b) < r" it expands the bounding box by the search distance and so
+    stays index-assisted. Use it for proximity joins, "everything within 500 m of this
+    address", and as the WHERE-clause partner to the <-> KNN operator in ORDER BY. A distance
+    of 0 makes it equivalent to ST_Intersects.
+  returns: boolean
+  since: "1.0 (geography since 1.5)"
+  arguments:
+    - name: A
+      type: geometry
+      description: First geometry or geography; put the indexed column here.
+    - name: B
+      type: geometry
+      description: Second geometry or geography, usually the reference feature.
+    - name: distance
+      type: double precision
+      description: Search radius, in SRID units for geometry and in metres for geography.
+    - name: use_spheroid
+      type: boolean
+      description: Geography form only. False uses the faster sphere instead of the spheroid.
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_DWithin('POINT(0 0)'::geometry, 'POINT(3 4)'::geometry, 5) AS within_5,
+             ST_DWithin('POINT(0 0)'::geometry, 'POINT(3 4)'::geometry, 4.9) AS within_4_9;
+    result: |2-
+       within_5 | within_4_9
+      ----------+------------
+       t        | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id, name
+              FROM stops
+              WHERE ST_DWithin(geog, ST_MakePoint(%s, %s)::geography, %s)
+              ORDER BY geog <-> ST_MakePoint(%s, %s)::geography
+              LIMIT 20
+              """,
+              (lon, lat, radius_m, lon, lat),
+          )
+          nearby = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2 import Geography
+      from geoalchemy2.functions import ST_DWithin, ST_MakePoint
+
+      here = ST_MakePoint(lon, lat).cast(Geography)
+      stmt = select(Stop.id, Stop.name).where(ST_DWithin(Stop.geog, here, radius_m)).limit(20)
+  srid_notes: >-
+    This is where the units bite hardest. On geometry the distance is in the SRID's units, so
+    ST_DWithin(geom, pt, 500) on SRID 4326 means 500 degrees, not 500 metres - either store a
+    projected column or cast both sides to geography. On geography the distance is always
+    metres regardless of the underlying SRID, and use_spheroid=false trades a little accuracy
+    for speed. Cast both sides explicitly rather than one: the two overloads mean different
+    things by the same number, so a half-cast call is ambiguous to the reader and easy to
+    get wrong. Note too that wrapping an indexed geometry column in ::geography stops a
+    geometry GiST index applying - you need an index on the geography column or expression.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Fully index-assisted: PostGIS rewrites it as an && against the reference box expanded by
+      the distance, then rechecks exactly. Do not hand-write ST_Expand plus && around it - the
+      planner already does that. Keep the indexed column as the first argument.
+  common_mistakes:
+    - "Writing ST_Distance(a, b) < r instead, which cannot use the index and scans the whole table."
+    - "Passing metres to the geometry form on SRID 4326, where the argument is degrees - 500 there is effectively the whole planet."
+    - "Casting the indexed column to geography inside the call. That is a function on the column and kills the geometry index; add a geography column or index the cast expression."
+  see_also:
+    - ST_Distance
+    - "<->"
+    - ST_Intersects
+    - ST_Expand
+    - ST_Buffer
+  tags: [predicate, proximity, radius, index, geography]
+  docs_url: https://www.postgis-python.com/mastering-core-spatial-query-patterns/
+
+- name: ST_Touches
+  category: relationships
+  signatures:
+    - "ST_Touches(geometry A, geometry B) -> boolean"
+  summary: >-
+    Returns true when two geometries share at least one boundary point but their interiors do
+    not intersect at all. It is the predicate for adjacency: neighbouring parcels, districts
+    sharing a border, road segments meeting end to end. Because it requires disjoint interiors,
+    two overlapping polygons never touch, and because it requires a shared point, two separated
+    polygons never touch either. Two points can never touch each other, since points have no
+    boundary.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: First geometry; its interior must not meet B's.
+    - name: B
+      type: geometry
+      description: Second geometry, sharing only boundary points with A.
+  example:
+    sql: |-
+      SELECT ST_Touches('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry,
+                        'POLYGON((10 0, 10 10, 20 10, 20 0, 10 0))'::geometry) AS shares_edge,
+             ST_Touches('POINT(0 0)'::geometry, 'POINT(0 0)'::geometry) AS two_points;
+    result: |2-
+       shares_edge | two_points
+      -------------+------------
+       t           | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT b.id
+              FROM parcels a
+              JOIN parcels b ON ST_Touches(a.geom, b.geom) AND a.id <> b.id
+              WHERE a.id = %s
+              """,
+              (parcel_id,),
+          )
+          neighbours = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from sqlalchemy.orm import aliased
+      from geoalchemy2.functions import ST_Touches
+
+      other = aliased(Parcel)
+      stmt = (
+          select(other.id)
+          .join(other, ST_Touches(Parcel.geom, other.geom))
+          .where(Parcel.id == parcel_id, other.id != parcel_id)
+      )
+  srid_notes: >-
+    Planar and SRID-strict. Adjacency is entirely a question of exact coordinate coincidence,
+    so this predicate is the most fragile one under reprojection: ST_Transform introduces
+    floating-point drift that can pull a shared vertex apart by a fraction of a unit and turn
+    neighbours into non-neighbours. Build adjacency in the SRID the data was digitised in, and
+    consider ST_SnapToGrid on both sides if the source came from different vendors.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Index-assisted through the standard && rewrite. Self-joins on a whole parcel table are
+      still expensive because every neighbouring box overlaps; restrict by area or process in
+      batches rather than materialising the full adjacency graph in one statement.
+  common_mistakes:
+    - "Expecting overlapping polygons to touch. Any interior intersection makes ST_Touches false."
+    - "Relying on it across differently projected copies of the same data, where rounding has already broken the shared vertices."
+    - "Forgetting the a.id <> b.id guard in a self-join, though a geometry never touches itself so this mostly costs work rather than correctness."
+  see_also:
+    - ST_Intersects
+    - ST_Overlaps
+    - ST_Relate
+    - ST_SnapToGrid
+    - ST_Boundary
+  tags: [predicate, de9im, adjacency, topology, index]
+
+- name: ST_Crosses
+  category: relationships
+  signatures:
+    - "ST_Crosses(geometry A, geometry B) -> boolean"
+  summary: >-
+    Returns true when the interiors of two geometries intersect, but the intersection has a
+    lower dimension than the higher-dimensional of the two inputs, and neither contains the
+    other. In practice that means a line crossing another line at a point, or a line passing
+    through a polygon's interior and out the other side. It is the predicate for "this route
+    crosses that boundary" checks - pipelines crossing property lines, rivers crossing
+    administrative borders. Two polygons can never cross, and two points can never cross.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: First geometry, typically a line.
+    - name: B
+      type: geometry
+      description: Second geometry, typically another line or a polygon.
+  example:
+    sql: |-
+      SELECT ST_Crosses('LINESTRING(0 0, 10 10)'::geometry,
+                        'LINESTRING(0 10, 10 0)'::geometry) AS lines_cross,
+             ST_Crosses('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry,
+                        'POLYGON((5 5, 5 15, 15 15, 15 5, 5 5))'::geometry) AS polys_cross;
+    result: |2-
+       lines_cross | polys_cross
+      -------------+-------------
+       t           | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT p.id, b.name
+              FROM pipelines p
+              JOIN boundaries b ON ST_Crosses(p.geom, b.geom)
+              WHERE p.id = %s
+              """,
+              (pipeline_id,),
+          )
+          crossings = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Crosses
+
+      stmt = (
+          select(Pipeline.id, Boundary.name)
+          .join(Boundary, ST_Crosses(Pipeline.geom, Boundary.geom))
+          .where(Pipeline.id == pipeline_id)
+      )
+  srid_notes: >-
+    Planar, SRID units, mixed SRIDs error. Crossing is a topological fact rather than a metric
+    one, so it is insensitive to the choice of projection in principle - but the straight
+    segments of a 4326 linestring follow a different path on the ground than the geodesics they
+    represent, so a long segment can cross a boundary in degree space that it misses in
+    reality. ST_Segmentize the line before testing if the segments span more than a degree or so.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Index-assisted via the usual && rewrite, but boxes are a weak filter for long diagonal
+      lines: a single motorway's box may overlap most of the country. Subdividing long linework
+      into shorter segments improves selectivity far more than any index tuning.
+  common_mistakes:
+    - "Using it for polygon-polygon overlap. Two polygons never cross; that case is ST_Overlaps."
+    - "Expecting a line that merely ends on a polygon boundary to cross it - it touches, it does not cross."
+    - "Testing very long unsegmentised 4326 linestrings, where the planar chord and the true geodesic disagree about which boundaries are crossed."
+  see_also:
+    - ST_Intersects
+    - ST_Overlaps
+    - ST_Touches
+    - ST_Relate
+    - ST_Segmentize
+  tags: [predicate, de9im, lines, topology, index]
+
+- name: ST_Overlaps
+  category: relationships
+  signatures:
+    - "ST_Overlaps(geometry A, geometry B) -> boolean"
+  summary: >-
+    Returns true when two geometries of the same dimension share some but not all of their
+    interior space - they intersect, but neither contains the other and the intersection has
+    the same dimension as the inputs. This is the predicate for genuine partial overlap, which
+    is what people usually mean when they say two polygons overlap and mistakenly reach for
+    ST_Intersects. It is the natural test for detecting conflicting land use, double-counted
+    coverage areas, or geometry that should have been dissolved.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: First geometry.
+    - name: B
+      type: geometry
+      description: Second geometry, which must have the same dimension as A for overlap to be possible.
+  example:
+    sql: |-
+      SELECT ST_Overlaps('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry,
+                         'POLYGON((5 5, 5 15, 15 15, 15 5, 5 5))'::geometry) AS partial,
+             ST_Overlaps('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry,
+                         'POLYGON((2 2, 2 4, 4 4, 4 2, 2 2))'::geometry) AS nested;
+    result: |2-
+       partial | nested
+      ---------+--------
+       t       | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT a.id, b.id
+              FROM service_areas a
+              JOIN service_areas b ON a.id < b.id AND ST_Overlaps(a.geom, b.geom)
+              """
+          )
+          conflicts = cur.fetchall()
+    geoalchemy: |-
+      from sqlalchemy import select
+      from sqlalchemy.orm import aliased
+      from geoalchemy2.functions import ST_Overlaps
+
+      b = aliased(ServiceArea)
+      stmt = (
+          select(ServiceArea.id, b.id)
+          .join(b, (ServiceArea.id < b.id) & ST_Overlaps(ServiceArea.geom, b.geom))
+      )
+  srid_notes: >-
+    Planar and SRID-strict, with no geography form. Overlap detection is often run on data
+    merged from several sources; if those sources arrived in different SRIDs and were
+    transformed into a common one, tiny reprojection slivers appear along shared edges and
+    ST_Overlaps will report them as real overlaps. Snap or clean with ST_SnapToGrid and check
+    ST_Area of the intersection before trusting the result.
+  index_usage:
+    gist: true
+    sargable: true
+    needs_bbox_prefilter: false
+    notes: >-
+      Index-assisted via the standard && rewrite. All-pairs overlap detection on a large table
+      is inherently quadratic in the candidate set, so add an a.id < b.id guard to halve the
+      work and consider ST_Subdivide on the largest polygons.
+  common_mistakes:
+    - "Using ST_Intersects when you meant ST_Overlaps, which then also reports nested and edge-touching pairs."
+    - "Testing geometries of different dimensions - a line and a polygon can never overlap, only cross or intersect."
+    - "Treating sliver overlaps from reprojection as real; filter by ST_Area of ST_Intersection above a tolerance."
+  see_also:
+    - ST_Intersects
+    - ST_Crosses
+    - ST_Contains
+    - ST_Intersection
+    - ST_Relate
+  tags: [predicate, de9im, overlap, topology, index]
+
+- name: ST_Disjoint
+  category: relationships
+  signatures:
+    - "ST_Disjoint(geometry A, geometry B) -> boolean"
+  summary: >-
+    Returns true when two geometries share no point whatsoever - the exact logical negation of
+    ST_Intersects. The important thing to know about it is operational rather than semantic: it
+    cannot be accelerated by a spatial index, because a bounding-box test can prove that two
+    things might intersect but can never prove that they do not without examining every
+    candidate. Every ST_Disjoint against a table is a full scan with an exact GEOS call per row.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: First geometry.
+    - name: B
+      type: geometry
+      description: Second geometry.
+  example:
+    sql: |-
+      SELECT ST_Disjoint('POINT(20 20)'::geometry,
+                         'POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry) AS apart,
+             ST_Disjoint('POINT(5 5)'::geometry,
+                         'POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'::geometry) AS together;
+    result: |2-
+       apart | together
+      -------+----------
+       t     | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          # NOT EXISTS + ST_Intersects keeps the index in play; ST_Disjoint would not.
+          cur.execute(
+              """
+              SELECT s.id
+              FROM sites s
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM protected_areas p
+                  WHERE ST_Intersects(s.geom, p.geom)
+              )
+              """
+          )
+          unconstrained = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select, exists
+      from geoalchemy2.functions import ST_Intersects
+
+      overlapping = exists().where(ST_Intersects(Site.geom, ProtectedArea.geom))
+      stmt = select(Site.id).where(~overlapping)
+  srid_notes: >-
+    Planar, SRID units, mixed SRIDs error, and no geography form. Disjointness is a global
+    property of the whole pair, so unlike the containment predicates there is no boundary
+    subtlety here - but that same globality is what makes it unindexable, since ruling a row
+    out requires the full exact test rather than a box comparison.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: false
+    notes: >-
+      NOT index-assisted. ST_Disjoint emits no && term because a box overlap does not imply an
+      intersection, so no candidate can be excluded from the index side. Rewrite it as
+      NOT ST_Intersects(a, b), or better as NOT EXISTS (SELECT 1 ... WHERE ST_Intersects(...)),
+      which lets the inner query use the GiST index and only the surviving rows are negated.
+  common_mistakes:
+    - "Assuming it performs like the other predicates. It is the one common relationship function with no index support at all."
+    - "Writing ST_Disjoint against a large table in a join, which produces a nested loop with an exact test on every pair."
+    - "Expecting NOT ST_Intersects on its own to fix it - you also need the NOT EXISTS or anti-join structure so that the indexed positive test runs first."
+  see_also:
+    - ST_Intersects
+    - ST_Relate
+    - ST_Touches
+    - "&&"
+  tags: [predicate, de9im, negation, performance, no-index]
+  docs_url: https://www.postgis-python.com/advanced-gist-indexing-optimization/
+
+- name: ST_Equals
+  category: relationships
+  signatures:
+    - "ST_Equals(geometry A, geometry B) -> boolean"
+  summary: >-
+    Returns true when two geometries occupy the same set of points, regardless of how those
+    points are ordered or how many vertices are used to describe them. A linestring and its
+    reverse are equal; a polygon whose ring starts at a different vertex is equal. This is
+    spatial equality, not binary equality, so use it when comparing geometry that has passed
+    through different pipelines, and use the = operator or a hash of ST_AsBinary when you need
+    to detect byte-level changes instead.
+  returns: boolean
+  since: "1.0"
+  arguments:
+    - name: A
+      type: geometry
+      description: First geometry.
+    - name: B
+      type: geometry
+      description: Second geometry.
+  example:
+    sql: |-
+      SELECT ST_Equals('LINESTRING(0 0, 10 10)'::geometry,
+                       'LINESTRING(10 10, 0 0)'::geometry) AS same_points,
+             'LINESTRING(0 0, 10 10)'::geometry = 'LINESTRING(10 10, 0 0)'::geometry AS same_bytes;
+    result: |2-
+       same_points | same_bytes
+      -------------+------------
+       t           | f
+    psycopg: |-
+      with conn.cursor() as cur:
+          cur.execute(
+              """
+              SELECT id
+              FROM boundaries_current c
+              WHERE EXISTS (
+                  SELECT 1 FROM boundaries_previous p
+                  WHERE p.id = c.id AND NOT ST_Equals(p.geom, c.geom)
+              )
+              """
+          )
+          changed_ids = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Equals
+
+      stmt = (
+          select(Current.id)
+          .join(Previous, Previous.id == Current.id)
+          .where(~ST_Equals(Previous.geom, Current.geom))
+      )
+  srid_notes: >-
+    Mixed SRIDs error, so two geometries describing the same place in different projections are
+    never comparable without an explicit ST_Transform - and after transforming, floating-point
+    drift usually means they are no longer exactly equal either. For cross-projection comparison
+    use ST_SnapToGrid on both sides first, or compare ST_Distance against a tolerance rather
+    than relying on exact equality.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      Unlike the other predicates in this category, the ST_Equals documentation page carries
+      no statement about an automatic bounding-box comparison, so do not assume it is
+      index-assisted; check EXPLAIN on your own version before relying on it. Adding an
+      explicit && prefilter is the safe way to force a box comparison. Note that the =
+      operator on geometry is a different thing entirely - it compares serialised
+      representations and is what btree indexes and DISTINCT use.
+  common_mistakes:
+    - "Confusing ST_Equals with the = operator. The former is spatial, the latter is byte-level, and they disagree on reversed or renumbered rings."
+    - "Expecting it to survive a round trip through ST_Transform, where floating-point drift breaks exact equality."
+    - "Using it on geometries with different vertex counts along the same line and being surprised it returns true - collinear extra vertices do not change the point set."
+  see_also:
+    - ST_Relate
+    - ST_Covers
+    - ST_SnapToGrid
+    - ST_AsBinary
+  tags: [predicate, equality, comparison, diffing, index]
+
+- name: ST_Relate
+  category: relationships
+  signatures:
+    - "ST_Relate(geometry A, geometry B) -> text"
+    - "ST_Relate(geometry A, geometry B, text intersectionMatrixPattern) -> boolean"
+    - "ST_Relate(geometry A, geometry B, integer boundaryNodeRule) -> text"
+  summary: >-
+    Computes the full DE-9IM intersection matrix describing how two geometries relate, or
+    tests that matrix against a pattern you supply. Every other predicate in this category is
+    a named shorthand for a particular pattern, so ST_Relate is the escape hatch for the
+    relationship that has no name - "a line whose interior meets a polygon's boundary but not
+    its interior", say. The three-character-class pattern language uses T for "must intersect",
+    F for "must not", * for "don't care", and digits for a required intersection dimension.
+  returns: text (boolean with the pattern form)
+  since: "1.0 (boundary node rule form since 2.0)"
+  arguments:
+    - name: A
+      type: geometry
+      description: First geometry; supplies the rows of the matrix.
+    - name: B
+      type: geometry
+      description: Second geometry; supplies the columns of the matrix.
+    - name: intersectionMatrixPattern
+      type: text
+      description: Nine-character DE-9IM pattern. Supplying it switches the return type to boolean.
+      optional: true
+    - name: boundaryNodeRule
+      type: integer
+      description: Boundary node rule (1 = OGC/Mod2, 2 = Endpoint, 3 = MultivalentEndpoint, 4 = MonovalentEndpoint).
+      optional: true
+  example:
+    sql: |-
+      SELECT ST_Relate('POINT(1 1)'::geometry,
+                       'POLYGON((0 0, 0 5, 5 5, 5 0, 0 0))'::geometry) AS matrix;
+    result: |2-
+        matrix
+      -----------
+       0FFFFF212
+    psycopg: |-
+      with conn.cursor() as cur:
+          # Lines that run along a boundary without entering the interior.
+          cur.execute(
+              """
+              SELECT r.id
+              FROM roads r
+              JOIN districts d ON r.district_id = d.id
+              WHERE ST_Relate(r.geom, d.geom, %s)
+              """,
+              ("F1FF0F212",),
+          )
+          edge_roads = [row[0] for row in cur]
+    geoalchemy: |-
+      from sqlalchemy import select
+      from geoalchemy2.functions import ST_Relate
+
+      stmt = (
+          select(Road.id)
+          .join(District, Road.district_id == District.id)
+          .where(ST_Relate(Road.geom, District.geom, "F1FF0F212"))
+      )
+  srid_notes: >-
+    Planar only, SRID-strict, and with no geography form - the DE-9IM model is defined on a
+    plane. Because the matrix distinguishes interior, boundary and exterior exactly, results
+    are highly sensitive to coordinate precision, so reprojected data will often produce a
+    different matrix than the source did. Compute relate matrices in the data's native SRID.
+  index_usage:
+    gist: false
+    sargable: false
+    needs_bbox_prefilter: true
+    notes: >-
+      ST_Relate does not emit an && term of its own, because an arbitrary pattern may be
+      satisfied by disjoint geometries. Add your own bounding-box prefilter - a.geom && b.geom,
+      or an ST_Intersects term - alongside it whenever the pattern implies the geometries must
+      meet, or you will get a full scan with a GEOS call per row.
+  common_mistakes:
+    - "Relying on it to use the index. Unlike the named predicates it emits no && term; pair it with an explicit && or ST_Intersects."
+    - "Writing a pattern with the arguments mentally reversed - rows are A, columns are B, so the matrix is not symmetric."
+    - "Using T where F was meant. T means 'must intersect', * means 'don't care'; a pattern of all T is far stricter than one of all *."
+  see_also:
+    - ST_Intersects
+    - ST_Touches
+    - ST_Crosses
+    - ST_Overlaps
+    - "&&"
+  tags: [predicate, de9im, matrix, advanced, topology]
