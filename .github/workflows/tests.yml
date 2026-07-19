@@ -1,0 +1,68 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest --cov=st_cheatsheet --cov-report=term-missing
+
+      # The dataset is the product, so a schema violation is a build failure.
+      - name: Validate the dataset
+        run: python -m st_cheatsheet validate
+
+      - name: Build the static page
+        run: |
+          set -euo pipefail
+          python -m st_cheatsheet build --out dist/
+          test -s dist/index.html
+
+      # The page must render from a file:// URL with no network. Only external
+      # *asset loads* break that — hyperlinks in the prose are fine and expected,
+      # so this deliberately checks src=, <link href=, and @import rather than
+      # every occurrence of https://.
+      - name: Assert the page loads no external assets
+        run: |
+          set -euo pipefail
+          if grep -inE '(<[^>]+\ssrc="https?://)|(<link[^>]+href="https?://)|(@import[^;]*https?://)' dist/index.html; then
+            echo "::error::dist/index.html loads an asset from an external host"
+            exit 1
+          fi
+          echo "no external asset loads"
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.python-version == '3.12'
+        with:
+          name: st-function-cheatsheet-page
+          path: dist/index.html
+          retention-days: 14
